@@ -210,6 +210,12 @@ struct llama_hparams {
     // for MiniMax-Text-01 linear attention
     uint32_t n_embd_head_la = 0;
 
+    // EdgeRock RMA: fixed-capacity memory of admitted K/V records on the attention layers
+    uint32_t n_mem_capacity     = 0; // committed records per KV head
+    uint32_t n_mem_chunk        = 0; // pending records committed at once
+    uint32_t n_mem_rank         = 0; // admission scorer rank
+    uint32_t n_mem_writer       = 0; // writer MLP size
+
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
     bool     kda_safe_gate = false;
@@ -483,6 +489,13 @@ struct llama_hparams {
 
     // dimension of the recurrent state embeddings
     uint32_t n_embd_s() const;
+
+    // per-layer variants, for models whose layers keep different kinds of recurrent state
+    uint32_t n_embd_r(uint32_t il) const;
+    uint32_t n_embd_s(uint32_t il) const;
+
+    // true if layer il keeps an RMA state instead of a regular recurrent state
+    bool has_mem(uint32_t il) const;
 
     uint32_t n_pos_per_embd() const;
 

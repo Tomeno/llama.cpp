@@ -2990,6 +2990,66 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.v_router",  # k2-horizon
         ),
 
+        MODEL_TENSOR.MEM_INPUT_NORM: (
+            "model.layers.{bid}.memory.input_norm",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_Q_NORM: (
+            "model.layers.{bid}.memory.q_norm",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_K_NORM: (
+            "model.layers.{bid}.memory.k_norm",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_Q: (
+            "model.layers.{bid}.memory.q_proj",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_K: (
+            "model.layers.{bid}.memory.k_proj",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_V: (
+            "model.layers.{bid}.memory.v_proj",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_OUT: (
+            "model.layers.{bid}.memory.o_proj",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_WRITE_GATE: (
+            "model.layers.{bid}.memory.write_gate_proj",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_WRITE_UP: (
+            "model.layers.{bid}.memory.write_up_proj",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_WRITE_DOWN: (
+            "model.layers.{bid}.memory.write_down_proj",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_ADMISSION_DOWN: (
+            "model.layers.{bid}.memory.admission_down",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_ADMISSION_UP: (
+            "model.layers.{bid}.memory.admission_up",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_READ_SCALE: (
+            "model.layers.{bid}.memory.read_scale",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_READ_GATE: (
+            "model.layers.{bid}.memory.read_gate_weight",  # edgerock
+        ),
+
+        MODEL_TENSOR.MEM_READ_GATE_BIAS: (
+            "model.layers.{bid}.memory.read_gate_bias",  # edgerock
+        ),
+
         MODEL_TENSOR.ATTN_V_EXP: (
             "model.layers.{bid}.self_attn.v_experts",  # k2-horizon
         ),

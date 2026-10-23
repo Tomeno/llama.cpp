@@ -79,6 +79,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Dots3NoteTextForCausalLM": "dots3",
     "DotsOCRForCausalLM": "qwen",
     "DreamModel": "dream",
+    "EdgeRockForCausalLM": "edgerock",
     "EmbeddingGemma2Model": "gemma",
     "Ernie4_5ForCausalLM": "ernie",
     "Ernie4_5_ForCausalLM": "ernie",

@@ -257,6 +257,28 @@ uint32_t llama_hparams::n_embd_s() const {
     return ssm_d_state * ssm_d_inner;
 }
 
+uint32_t llama_hparams::n_embd_r(uint32_t il) const {
+    if (has_mem(il)) {
+        // pending records: K and V [n_embd_head_k, n_mem_chunk, n_head_kv] + admission scores [n_mem_chunk, n_head_kv]
+        return (2*n_embd_head_k(il) + 1) * n_mem_chunk * n_head_kv(il);
+    }
+
+    return n_embd_r();
+}
+
+uint32_t llama_hparams::n_embd_s(uint32_t il) const {
+    if (has_mem(il)) {
+        // committed records: K and V [n_embd_head_k, n_mem_capacity, n_head_kv] + scores and valid flags [n_mem_capacity, n_head_kv]
+        return (2*n_embd_head_k(il) + 2) * n_mem_capacity * n_head_kv(il);
+    }
+
+    return n_embd_s();
+}
+
+bool llama_hparams::has_mem(uint32_t il) const {
+    return n_mem_capacity > 0 && il < n_layer() && !is_recr(il);
+}
+
 bool llama_hparams::is_recr(uint32_t il) const {
     if (il < n_layer_all) {
         return is_recr_impl[il];

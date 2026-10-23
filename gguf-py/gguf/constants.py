@@ -290,6 +290,12 @@ class Keys:
         LLM_KV_SPLIT_COUNT         = "split.count"
         LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count"
 
+    class Memory:
+        CAPACITY            = "{arch}.memory.capacity"
+        COMMIT_CHUNK        = "{arch}.memory.commit_chunk"
+        ADMISSION_RANK      = "{arch}.memory.admission_rank"
+        WRITER_INTERMEDIATE = "{arch}.memory.writer_intermediate"
+
     class HRM:
         LAYERS_PER_STACK = "{arch}.hrm.layers_per_stack"
         H_CYCLES         = "{arch}.hrm.h_cycles"
@@ -587,6 +593,7 @@ class MODEL_ARCH(IntEnum):
     QWEN3VL          = auto()
     QWEN3VLMOE       = auto()
     QWEN35           = auto()
+    EDGEROCK         = auto()
     QWEN35MOE        = auto()
     CLEF             = auto()
     VLLM_DECISION2   = auto()
@@ -1008,6 +1015,21 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_KPOOL_GATE   = auto()
     INDEXER_KPOOL_APE    = auto()
     ATTN_V_GATE          = auto() # k2-horizon MoVA router
+    MEM_INPUT_NORM      = auto() # edgerock RMA
+    MEM_Q_NORM          = auto() # edgerock RMA
+    MEM_K_NORM          = auto() # edgerock RMA
+    MEM_Q               = auto() # edgerock RMA
+    MEM_K               = auto() # edgerock RMA
+    MEM_V               = auto() # edgerock RMA
+    MEM_OUT             = auto() # edgerock RMA
+    MEM_WRITE_GATE      = auto() # edgerock RMA
+    MEM_WRITE_UP        = auto() # edgerock RMA
+    MEM_WRITE_DOWN      = auto() # edgerock RMA
+    MEM_ADMISSION_DOWN  = auto() # edgerock RMA
+    MEM_ADMISSION_UP    = auto() # edgerock RMA
+    MEM_READ_SCALE      = auto() # edgerock RMA
+    MEM_READ_GATE       = auto() # edgerock RMA
+    MEM_READ_GATE_BIAS  = auto() # edgerock RMA
     ATTN_V_EXP           = auto() # k2-horizon MoVA value experts
     # vision
     V_MMPROJ             = auto()
@@ -1406,6 +1428,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN3VL:          "qwen3vl",
     MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
     MODEL_ARCH.QWEN35:           "qwen35",
+    MODEL_ARCH.EDGEROCK:         "edgerock",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
     MODEL_ARCH.CLEF:             "clef",
     MODEL_ARCH.VLLM_DECISION2:   "vllm-decision2",
@@ -2177,6 +2200,21 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.LILICORR_ANCHOR_OUT_HEAD:              "lilicorr.anchor_out_head",
     MODEL_TENSOR.D2T:                       "d2t",
     MODEL_TENSOR.ATTN_V_GATE:               "blk.{bid}.attn_v_gate",
+    MODEL_TENSOR.MEM_INPUT_NORM:             "blk.{bid}.memory.input_norm",
+    MODEL_TENSOR.MEM_Q_NORM:                 "blk.{bid}.memory.q_norm",
+    MODEL_TENSOR.MEM_K_NORM:                 "blk.{bid}.memory.k_norm",
+    MODEL_TENSOR.MEM_Q:                      "blk.{bid}.memory.q_proj",
+    MODEL_TENSOR.MEM_K:                      "blk.{bid}.memory.k_proj",
+    MODEL_TENSOR.MEM_V:                      "blk.{bid}.memory.v_proj",
+    MODEL_TENSOR.MEM_OUT:                    "blk.{bid}.memory.o_proj",
+    MODEL_TENSOR.MEM_WRITE_GATE:             "blk.{bid}.memory.write_gate_proj",
+    MODEL_TENSOR.MEM_WRITE_UP:               "blk.{bid}.memory.write_up_proj",
+    MODEL_TENSOR.MEM_WRITE_DOWN:             "blk.{bid}.memory.write_down_proj",
+    MODEL_TENSOR.MEM_ADMISSION_DOWN:         "blk.{bid}.memory.admission_down",
+    MODEL_TENSOR.MEM_ADMISSION_UP:           "blk.{bid}.memory.admission_up",
+    MODEL_TENSOR.MEM_READ_SCALE:             "blk.{bid}.memory.read_scale",
+    MODEL_TENSOR.MEM_READ_GATE:              "blk.{bid}.memory.read_gate_weight",
+    MODEL_TENSOR.MEM_READ_GATE_BIAS:         "blk.{bid}.memory.read_gate_bias",
     MODEL_TENSOR.ATTN_V_EXP:                "blk.{bid}.attn_v_exps",
 }
 
@@ -3148,6 +3186,47 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HNORM,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+    ],
+    MODEL_ARCH.EDGEROCK: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.CLS_OUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.MEM_INPUT_NORM,
+        MODEL_TENSOR.MEM_Q_NORM,
+        MODEL_TENSOR.MEM_K_NORM,
+        MODEL_TENSOR.MEM_Q,
+        MODEL_TENSOR.MEM_K,
+        MODEL_TENSOR.MEM_V,
+        MODEL_TENSOR.MEM_OUT,
+        MODEL_TENSOR.MEM_WRITE_GATE,
+        MODEL_TENSOR.MEM_WRITE_UP,
+        MODEL_TENSOR.MEM_WRITE_DOWN,
+        MODEL_TENSOR.MEM_ADMISSION_DOWN,
+        MODEL_TENSOR.MEM_ADMISSION_UP,
+        MODEL_TENSOR.MEM_READ_SCALE,
+        MODEL_TENSOR.MEM_READ_GATE,
+        MODEL_TENSOR.MEM_READ_GATE_BIAS,
     ],
     MODEL_ARCH.CLEF: [
         MODEL_TENSOR.TOKEN_EMBD,

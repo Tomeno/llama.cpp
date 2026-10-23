@@ -225,6 +225,25 @@ struct llama_layer_shortconv {
     struct ggml_tensor * out_proj = nullptr;
 };
 
+// EdgeRock RMA (fixed-capacity memory next to the sliding window attention)
+struct llama_layer_mem {
+    struct ggml_tensor * input_norm     = nullptr;
+    struct ggml_tensor * q_norm         = nullptr;
+    struct ggml_tensor * k_norm         = nullptr;
+    struct ggml_tensor * wq             = nullptr;
+    struct ggml_tensor * wk             = nullptr;
+    struct ggml_tensor * wv             = nullptr;
+    struct ggml_tensor * wo             = nullptr;
+    struct ggml_tensor * write_gate     = nullptr;
+    struct ggml_tensor * write_up       = nullptr;
+    struct ggml_tensor * write_down     = nullptr;
+    struct ggml_tensor * admission_down = nullptr;
+    struct ggml_tensor * admission_up   = nullptr;
+    struct ggml_tensor * read_scale     = nullptr;
+    struct ggml_tensor * read_gate      = nullptr;
+    struct ggml_tensor * read_gate_b    = nullptr;
+};
+
 struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
@@ -637,6 +656,8 @@ struct llama_layer {
     struct llama_layer_shortconv shortconv;
 
     struct llama_layer_nextn nextn;
+
+    struct llama_layer_mem mem;
 
     struct llama_layer_switch_lora switch_lora;
 };

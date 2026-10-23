@@ -4086,8 +4086,11 @@ private:
                             // starting at pos_eval - n_swa + 1 is enough, while a state without SWA must end before pos_eval
                             const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
 
+                            // with a recurrent part the pos_min of a state is its last position, so it must end before pos_eval even with SWA
+                            const int32_t n_swa_thold = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt) ? 0 : n_swa;
+
                             // a state or a checkpoint is useful when its pos_min is below this threshold
-                            const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+                            const auto pos_min_thold = std::max(0, n_swa_thold > 0 ? pos_eval - n_swa_thold + 2 : pos_eval);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
