@@ -5,57 +5,65 @@ evolution strategies (ES) with Adam. No backward pass is needed, so it works wit
 from embedding inputs, including recurrent and hybrid models such as EdgeRock where llama.cpp has no backward ops.
 
 ```
-[before text] [K soft embeddings] [after text] [example prompt] [example response]
-                                                                 ^ scored (teacher-forced NLL)
+[before text] [K soft embeddings] [after text + formatted prompt] [response]
 ```
 
-The default texts make the soft prompt a ChatML system turn and the example a user turn followed by
+The default texts make the soft prompt a ChatML system turn and the prompt a user turn followed by
 `<|im_start|>assistant\n<think>\n`, the EdgeRock format. Initializing from `--init-text` uses the token embeddings
-of that text, so step 0 is exactly the text prompt (the tool's `eval` mode reproduces the text prompt's loss).
+of that text, so step 0 is exactly the text prompt.
+
+## Layout
+
+The performance-critical parts are a C++ shared library; everything else is Python (numpy, ctypes, gguf-py).
+
+| file | |
+| - | - |
+| `soft-prompt.cpp/.h` | `libllama-soft-prompt`: batched sampling and teacher-forced log-prob scoring, every sequence of one context with its own soft prompt; tokenizer and token embeddings |
+| `softprompt.py` | ctypes bindings (`Engine`), template, soft prompt files (GGUF), shared arguments |
+| `es.py` | antithetic ES + Adam, optional low-rank (EGGROLL-style) noise, rank shaping |
+| `rewards.py` | meta-talk regexes, sentence repetition, token loops, answer matching, Kimi length reward, DAPO overlong penalty |
+| `rollout.py` | sampling groups of responses and rewarding them, external reward command |
+| `train_nll.py` | minimize the NLL of given responses (`--eval-only`: NLL with and without the soft prompt) |
+| `probe.py` | sample and report the reward terms, and how many groups have a reward spread |
+| `grpo.py` | Dr. GRPO advantages, DAPO dynamic sampling / clip-higher / token-level or constant normalization, k3 KL to the initial soft prompt; the clipped surrogate is evaluated with teacher forcing for every ES member |
+| `generate.py` | sample one response |
+| `slice_model.py` | copy of a GGUF model with a subset of its blocks, for quick tests |
+
+Build the library with the `llama-soft-prompt` target; the scripts find it in `build/bin` (or set `SOFTPROMPT_LIB`).
 
 ## Usage
 
-Data is JSONL, one `{"prompt": ..., "response": ...}` per line. The response is scored as is, so for a thinking
-model it starts inside the `<think>` block and contains the closing `</think>` and the answer.
-
 ```bash
-# train (16 GB GPU: a 4B Q4 model with 16-32 population members fits)
-llama-soft-prompt -m EdgeRock-4B-Q4_K_M.gguf --train train.jsonl --val val.jsonl \
-    --init-text "Solve the problem independently with a concise, logically rigorous derivation." \
-    --pairs 8 --examples 4 --steps 500 --sigma 0.05 --lr 0.01 -o sp.gguf
+cmake --build build --target llama-soft-prompt
+cd examples/soft-prompt
 
-# validation loss of a soft prompt vs no soft prompt
-llama-soft-prompt -m EdgeRock-4B-Q4_K_M.gguf --mode eval --val val.jsonl --init-file sp.gguf
+# base rate of the meta-talk with a text prompt (prompts: JSONL {"prompt", optional "answer"})
+python probe.py -m EdgeRock-4B-Q4_K_M.gguf --prompts simple.jsonl --group 8 --gen-max 256 --init-text "..."
 
-# generate with a soft prompt
-llama-soft-prompt -m EdgeRock-4B-Q4_K_M.gguf --mode generate --init-file sp.gguf -p "What is 17*23?" -n 2048
+# GRPO on the meta-talk / loop reward with short rollouts
+python grpo.py -m EdgeRock-4B-Q4_K_M.gguf --train simple.jsonl --val simple_val.jsonl --init-text "..." \
+    --prompts 16 --group 8 --gen-min 128 --gen-max 384 --pairs 8 --es-steps 2 -o sp.gguf --samples-out samples.jsonl
+
+# teacher-forced NLL on given responses (JSONL {"prompt", "response"})
+python train_nll.py -m EdgeRock-4B-Q4_K_M.gguf --train train.jsonl --val val.jsonl --init-text "..." -o sp.gguf
+
+python generate.py -m EdgeRock-4B-Q4_K_M.gguf --init-file sp.gguf -p "What is 17*23?"
 ```
 
-`sp.gguf` holds the tensor `soft_prompt.embd` (F32, `[n_embd, K]`) and the before/after/example texts it was
-trained with; `sp.gguf.last` is the latest step, `sp.gguf` the best validation loss.
-
-Options that matter:
-
-- `--pairs N`: population 2N, run as 2N parallel sequences of one context; memory is 2N sequence states.
-- `--examples N`: examples per pair and step. A step costs 2 x pairs x examples forward passes.
-- `--assign shared|split`: every pair on the same examples (default), or every pair on its own examples, which
-  sees more data per step at the same cost. Both members of a pair always share their examples, so the antithetic
-  difference cancels the difficulty of the examples.
-- `--shaping none|rank`: weights of the pair differences; `rank` is robust to outlier examples.
-- `--rank R`: low-rank noise `A B^T` over the `[K, n_embd]` soft prompt (EGGROLL-style); 0 = full rank.
-- `--sigma`, `--lr`: relative to the RMS of the init embeddings.
-- `--max-outputs`: logits rows per decode call; host memory is rows x n_vocab x 4 bytes.
+`--par` sets the parallel sequences of the context (each holds a full sequence state, about 165 MiB for EdgeRock-4B);
+the population needs `2 x --pairs` of them.
 
 ## Verified
 
 - the soft prompt initialized from a text gives the same loss as that text as tokens, for any batch size and any
-  number of parallel sequences
-- ES lowers the held-out loss on a toy EdgeRock (random weights, synthetic targets): 20.27 -> 17.68 in 60 steps
+  number of parallel sequences (exactly; on quantized models only when the batch splits match)
+- ES lowers the held-out loss on a toy EdgeRock (random weights, synthetic targets)
+- probe and grpo run end to end on the toy model; not yet run on the real model
 - tested on CPU only
 
 ## Plan
 
-### Option 2: soft prompt (this tool)
+### Option 2: soft prompt (these scripts)
 
 1. Data. Teacher-forced NLL needs target responses. The intended source is the model itself:
    sample N responses per training problem with the best text prompt (temperature 0.6, top-p 0.95, top-k 20),
