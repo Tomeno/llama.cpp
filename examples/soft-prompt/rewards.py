@@ -33,6 +33,7 @@ class RewardConfig:
     w_correct: float = 1.0   # final answer matches the reference
     w_len: float = 0.0       # Kimi-style group length reward, correct answers only
     overlong: int = 0        # DAPO soft overlong penalty over the last N tokens before the budget (0: off)
+    answer_mode: str = "final"  # final: answer after </think>; prefix: the response starts with the answer (continuation)
 
     def __post_init__(self):
         self._re = [re.compile(p, re.IGNORECASE) for p in self.patterns]
@@ -99,6 +100,12 @@ def loop_fraction(toks, n: int = 12) -> float:
     return 1.0 - len(set(grams)) / len(grams)
 
 
+def starts_with_answer(text: str, ref: str) -> bool:
+    """Continuation: the text starts with the reference, followed by a non-alphanumeric character or the end."""
+    t, r = text.lstrip(), ref.strip()
+    return t.startswith(r) and (len(t) == len(r) or not t[len(r)].isalnum())
+
+
 def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: RewardConfig, think_toks=None) -> dict:
     """Reward terms of one sample; the group length term and the total are added by finish()."""
     think, rest = thinking(text)
@@ -117,7 +124,10 @@ def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: Rewar
         "r_overlong": 0.0,
     }
     if answer:
-        out["correct"] = rest is not None and answer_matches(extract_answer(rest), answer)
+        if cfg.answer_mode == "prefix":
+            out["correct"] = starts_with_answer(text, answer)
+        else:
+            out["correct"] = rest is not None and answer_matches(extract_answer(rest), answer)
     if cfg.overlong > 0 and n_tokens > max_new - cfg.overlong:
         out["r_overlong"] = (max_new - cfg.overlong - n_tokens) / cfg.overlong
     return out
@@ -148,8 +158,11 @@ def add_reward_args(ap):
     g.add_argument("--w-correct", type=float, default=1.0)
     g.add_argument("--w-len", type=float, default=0.0, help="group length reward for correct answers")
     g.add_argument("--overlong", type=int, default=0, help="DAPO soft overlong penalty over the last N tokens (0: off)")
+    g.add_argument("--answer-mode", choices=["final", "prefix"], default="final",
+                   help="final: the answer after </think>; prefix: the response starts with the answer (continuation)")
 
 
 def config_from_args(args) -> RewardConfig:
     pats = RewardConfig.load_patterns(args.patterns) if args.patterns else list(DEFAULT_PATTERNS)
-    return RewardConfig(pats, args.w_meta, args.w_any, args.w_rep, args.w_loop, args.w_correct, args.w_len, args.overlong)
+    return RewardConfig(pats, args.w_meta, args.w_any, args.w_rep, args.w_loop, args.w_correct, args.w_len, args.overlong,
+                        args.answer_mode)
