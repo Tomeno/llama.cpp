@@ -33,7 +33,8 @@ class RewardConfig:
     w_correct: float = 1.0   # final answer matches the reference
     w_len: float = 0.0       # Kimi-style group length reward, correct answers only
     overlong: int = 0        # DAPO soft overlong penalty over the last N tokens before the budget (0: off)
-    answer_mode: str = "final"  # final: answer after </think>; prefix: the response starts with the answer (continuation)
+    answer_mode: str = "final"  # final: extracted answer after </think> equals the reference; contains: the reference appears
+                                # as a word after </think>; prefix: the response starts with the reference (continuation)
 
     def __post_init__(self):
         self._re = [re.compile(p, re.IGNORECASE) for p in self.patterns]
@@ -106,6 +107,11 @@ def starts_with_answer(text: str, ref: str) -> bool:
     return t.startswith(r) and (len(t) == len(r) or not t[len(r)].isalnum())
 
 
+def contains_answer(text: str, ref: str) -> bool:
+    """The reference appears as a whole word (case-insensitive) in the text."""
+    return re.search(r"(?<![0-9A-Za-z])" + re.escape(ref.strip()) + r"(?![0-9A-Za-z])", text, re.IGNORECASE) is not None
+
+
 def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: RewardConfig, think_toks=None) -> dict:
     """Reward terms of one sample; the group length term and the total are added by finish()."""
     think, rest = thinking(text)
@@ -126,6 +132,8 @@ def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: Rewar
     if answer:
         if cfg.answer_mode == "prefix":
             out["correct"] = starts_with_answer(text, answer)
+        elif cfg.answer_mode == "contains":
+            out["correct"] = rest is not None and contains_answer(rest, answer)
         else:
             out["correct"] = rest is not None and answer_matches(extract_answer(rest), answer)
     if cfg.overlong > 0 and n_tokens > max_new - cfg.overlong:
@@ -158,8 +166,9 @@ def add_reward_args(ap):
     g.add_argument("--w-correct", type=float, default=1.0)
     g.add_argument("--w-len", type=float, default=0.0, help="group length reward for correct answers")
     g.add_argument("--overlong", type=int, default=0, help="DAPO soft overlong penalty over the last N tokens (0: off)")
-    g.add_argument("--answer-mode", choices=["final", "prefix"], default="final",
-                   help="final: the answer after </think>; prefix: the response starts with the answer (continuation)")
+    g.add_argument("--answer-mode", choices=["final", "contains", "prefix"], default="final",
+                   help="final: the extracted answer after </think> equals the reference; contains: the reference appears as a"
+                        " word after </think>; prefix: the response starts with the reference (continuation)")
 
 
 def config_from_args(args) -> RewardConfig:
