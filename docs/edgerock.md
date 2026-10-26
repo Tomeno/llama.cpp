@@ -187,8 +187,8 @@ From `llama-server`:
 - `train_nll.py` (NLL), `grpo.py` (Dr. GRPO + DAPO dynamic sampling / clip-higher / normalization + k3 KL, the
   surrogate evaluated with teacher forcing for every ES member), `probe.py` (reward base rates), `generate.py`.
 - Verified: a soft prompt initialized from text reproduces that text prompt exactly; ES lowers held-out NLL on
-  EdgeRock-4B (arithmetic continuation from an unhelpful init: val NLL 0.402 -> 0.218 (10 steps) -> 0.147 (20 steps);
-  see the README for the final numbers and baselines).
+  EdgeRock-4B (arithmetic continuation from an unhelpful init: val NLL 0.402 -> 0.077 and greedy accuracy 71.9% ->
+  93.8% in 40 ES steps; a good text prompt starts at 0.012 / 100% on that task, see the README).
 - Plan: probe the meta-talk base rate -> GRPO stage A on short rollouts (meta-talk / repetition / loop penalties) ->
   stage B on full rollouts with length rewards; option 3 (initial state tuning) only if soft prompts saturate.
 

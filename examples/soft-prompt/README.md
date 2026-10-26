@@ -179,9 +179,9 @@ Results on EdgeRock-4B Q4_K_M (CPU, 2-digit multiplication only, 32 validation p
 | "Lorem ipsum ..." (deliberately unhelpful start) | 0.402 | 71.9% |
 | none | 0.269 | |
 | "Multiplication table practice with answers:\n12*12=144\n" | 0.012 | 100% |
-| soft prompt from "Lorem ipsum ...", ES step 10 / 20 / 30 / 40 | 0.218 / 0.147 / see docs | |
+| soft prompt from "Lorem ipsum ..." after ES steps 10 / 20 / 30 / 40 | 0.218 / 0.147 / 0.106 / 0.077 | 93.8% (after 40) |
 
-i.e. ES learns on the real model; from a good text prompt there is little left to learn on this task, so use a
+(40 steps x 16 members x 8 examples took ~2 h on the 4-core CPU.) ES learns on the real model; from a good text prompt there is little left to learn on this task, so use a
 harder task (or a weaker start) to see improvements over a normal prompt.
 
 ## Verified
@@ -189,7 +189,7 @@ harder task (or a weaker start) to see improvements over a normal prompt.
 - the soft prompt initialized from a text gives exactly the loss of that text as tokens (F32 tiny model: identical for
   every batch size and number of parallel sequences; quantized models: identical when the batch splits match, the
   quantized kernels themselves depend on the batch shape)
-- ES lowers held-out NLL on a toy model and on EdgeRock-4B (arithmetic, above)
+- ES lowers held-out NLL on a toy model and on EdgeRock-4B (arithmetic, above: 0.402 -> 0.077, accuracy 71.9% -> 93.8%)
 - probe and grpo run end to end (toy model); GRPO has not been run on the real model yet
 - CPU only; CUDA is untested (see `docs/edgerock.md`, "GPU")
 

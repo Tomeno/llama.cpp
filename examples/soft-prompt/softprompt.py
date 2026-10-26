@@ -202,11 +202,12 @@ def load_soft_prompt(path: str) -> tuple[np.ndarray, Template, dict]:
     r = gguf.GGUFReader(path)
 
     def s(key: str) -> str:
-        f = r.fields[key]
-        return bytes(f.parts[f.data[0]]).decode()
+        # GGUFWriter.add_string skips empty strings, so a missing template part is an empty one
+        f = r.fields.get(key)
+        return bytes(f.parts[f.data[0]]).decode() if f is not None else ""
 
     tpl = Template(s("soft_prompt.before"), s("soft_prompt.after"), s("soft_prompt.example"))
-    meta = json.loads(s("soft_prompt.meta")) if "soft_prompt.meta" in r.fields else {}
+    meta = json.loads(s("soft_prompt.meta") or "{}")
     t = next(t for t in r.tensors if t.name == "soft_prompt.embd")
     theta = np.array(t.data, dtype=np.float32).reshape(int(t.shape[1]), int(t.shape[0]))
     return theta, tpl, meta
