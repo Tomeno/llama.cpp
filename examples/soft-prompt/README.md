@@ -203,9 +203,12 @@ harder task (or a weaker start) to see improvements over a normal prompt.
   commit / read counts were made exact (every ubatch ran a full commit and two reads over 24 x 8 MB of records per
   layer, also with nothing to commit), 11.0 s after (bit-identical results), 9.8 s with the shared prefix (rounding
   level changes: the prefix KV cells are shared), 7.9 s with the log-probs on the device (full 85-token chunks per
-  sequence instead of 21, so that the logits fit on the host; same chunks: within 1.3e-7 of the host log-softmax).
-- Every distinct soft prompt of a round is evaluated once and copied to the other sequences (`seq_cp` plus
-  `llama_memory_seq_unshare`, so that their states can be replaced); state tuning evaluates a single prefix per round.
+  sequence instead of 21, so that the logits fit on the host; same chunks: within 1.3e-7 of the host log-softmax),
+  5.3 s with one state upload per distinct state and the jobs sorted by length (similar lengths per round: recurrent
+  ubatches need equal tokens per sequence, so ragged rounds split into many small ubatches). Soft prompt ES: 5.9 s.
+- Every distinct soft prompt of a round (compared by content) is evaluated once, every distinct state set once, and
+  copied to the other sequences (`seq_cp` plus `llama_memory_seq_unshare`); state tuning evaluates a single prefix
+  per round. `Engine.score` runs the longest jobs first; `es.score_population` does too, keeping the mirrored slots.
   Prompts are still re-run per job; processing the prompt once per sample group would be the next step.
 - Device log-probs are a softmax plus a gather, clamped at about -87.3 (probabilities below FLT_MIN).
 - Noise is generated on the host (numpy) and the members are copied in every call; fine for K x n_embd = 82k values.

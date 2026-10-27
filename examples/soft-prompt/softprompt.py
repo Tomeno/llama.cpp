@@ -161,11 +161,20 @@ class Engine:
         return out
 
     def score(self, thetas: np.ndarray, theta_idx: Sequence[int], posts: Sequence[np.ndarray], resps: Sequence[np.ndarray],
-              temp: float = 1.0, states: np.ndarray | None = None) -> list[np.ndarray]:
+              temp: float = 1.0, states: np.ndarray | None = None, sort: bool = True) -> list[np.ndarray]:
         """Teacher-forced log-probs of resps[j] after posts[j] with the soft prompt thetas[theta_idx[j]].
 
         thetas: [n_theta, K, n_embd] float32; states: None or [n_theta, n_state], the recurrent state that replaces the
-        one after the prefix; returns one array of len(resps[j]) log-probs per job."""
+        one after the prefix; returns one array of len(resps[j]) log-probs per job.
+        sort: run the longest jobs first (similar lengths per round); False keeps the order, i.e. the sequence slots."""
+        if sort and len(resps) > 1:
+            order = np.argsort([-(len(p) + len(r)) for p, r in zip(posts, resps)], kind="stable")
+            lp = self.score(thetas, np.asarray(theta_idx)[order], [posts[k] for k in order], [resps[k] for k in order],
+                            temp, states, sort=False)
+            out = [None] * len(order)
+            for k, x in zip(order, lp):
+                out[k] = x
+            return out
         th = np.ascontiguousarray(thetas, dtype=np.float32)
         if th.ndim == 2:
             th = th[None]

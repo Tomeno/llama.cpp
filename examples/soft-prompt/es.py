@@ -59,9 +59,12 @@ def score_population(eng, pop: np.ndarray, idx, posts, resps, *args, **kw) -> li
     idx = np.asarray(idx)
     plus, minus = np.flatnonzero(idx % 2 == 0), np.flatnonzero(idx % 2 == 1)
     assert len(plus) == len(minus)
+    # longest jobs first, so that the sequences of a round have similar lengths (fewer, fuller ubatches)
+    by_len = np.argsort([-(len(posts[k]) + len(resps[k])) for k in plus], kind="stable")
+    plus, minus = plus[by_len], minus[by_len]
     order = np.concatenate([np.concatenate([plus[k:k + eng.n_seq], minus[k:k + eng.n_seq]])
                             for k in range(0, len(plus), eng.n_seq)]) if len(plus) else plus
-    lp = eng.score(pop, idx[order], [posts[k] for k in order], [resps[k] for k in order], *args, **kw)
+    lp = eng.score(pop, idx[order], [posts[k] for k in order], [resps[k] for k in order], *args, sort=False, **kw)
     out = [None] * len(idx)
     for k, x in zip(order, lp):
         out[k] = x

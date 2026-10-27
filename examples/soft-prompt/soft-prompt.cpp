@@ -59,7 +59,7 @@ static std::string g_error;
 
 // phase timing (SP_PROFILE=1): synchronizes after every phase and prints a summary after every sp_score call
 struct sp_prof {
-    enum { PREFIX, STATE, DECODE, LOGPROBS, N };
+    enum { PREFIX, DECODE, LOGPROBS, N };
     bool    on = getenv("SP_PROFILE") != nullptr;
     int64_t t[N] = {};
     int64_t n_dec = 0, n_tok = 0, n_out = 0;
@@ -182,23 +182,40 @@ static int chunk(const sp_ctx * c, int ns) {
     return std::max(1, c->n_batch / ns);
 }
 
-// clears the memory and processes the prefix (before + soft prompt) on sequences 0 .. embd.size()-1,
-// returns the next position; sequences with the same soft prompt (pointer) share one evaluation (seq_cp)
-static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, int n_soft) {
+// clears the memory and processes the prefix (before + soft prompt embd[s]) on sequences s = 0 .. embd.size()-1, then
+// replaces their recurrent states by states[s] (if not nullptr); returns the next position.
+// Every distinct soft prompt is evaluated once and every distinct (soft prompt, state) set once, the other sequences
+// get copies (seq_cp + unshare)
+static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, const std::vector<const float *> & states, int n_soft) {
     llama_memory_t mem = llama_get_memory(c->ctx);
     llama_memory_clear(mem, true);
 
-    std::vector<llama_seq_id> seqs; // the first sequence of every distinct soft prompt
-    std::vector<const float *> uembd;
-    std::vector<llama_seq_id> src(embd.size());
-    for (size_t s = 0; s < embd.size(); ++s) {
-        const auto it = std::find(uembd.begin(), uembd.end(), embd[s]);
-        if (it == uembd.end()) {
-            src[s] = (llama_seq_id) s;
-            seqs.push_back((llama_seq_id) s);
-            uembd.push_back(embd[s]);
-        } else {
-            src[s] = seqs[it - uembd.begin()];
+    const int    ns     = (int) embd.size();
+    const size_t n_byte = (size_t) n_soft*c->n_embd*sizeof(float);
+    auto same_theta = [&](int a, int b) {
+        return embd[a] == embd[b] || (n_byte > 0 && memcmp(embd[a], embd[b], n_byte) == 0);
+    };
+    auto state_of = [&](int s) { return states.empty() ? nullptr : states[s]; };
+
+    std::vector<int> rep_t(ns), rep_s(ns); // the first sequence with the same soft prompt / soft prompt and state
+    std::vector<llama_seq_id> seqs;        // the distinct soft prompts
+    for (int s = 0; s < ns; ++s) {
+        rep_t[s] = s;
+        rep_s[s] = s;
+        for (int t = 0; t < s; ++t) {
+            if (rep_t[t] == t && same_theta(t, s)) {
+                rep_t[s] = t;
+                break;
+            }
+        }
+        for (int t = 0; t < s; ++t) {
+            if (rep_s[t] == t && rep_t[t] == rep_t[s] && state_of(t) == state_of(s)) {
+                rep_s[s] = t;
+                break;
+            }
+        }
+        if (rep_t[s] == s) {
+            seqs.push_back(s);
         }
     }
     const int nu = (int) seqs.size();
@@ -219,18 +236,33 @@ static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, int
         const int n = std::min(chunk(c, nu), n_soft - i);
         std::vector<const float *> part(nu);
         for (int u = 0; u < nu; ++u) {
-            part[u] = uembd[u] + (size_t) i*c->n_embd;
+            part[u] = embd[seqs[u]] + (size_t) i*c->n_embd;
         }
         decode_soft(c, seqs, part, n, pos);
         pos += n;
     }
-    // the copies get their own recurrent cells now, so that their states can be replaced
-    for (size_t s = 0; s < embd.size() && pos > 0; ++s) {
-        if (src[s] != (llama_seq_id) s) {
-            llama_memory_seq_cp(mem, src[s], (llama_seq_id) s, -1, -1);
-            if (!llama_memory_seq_unshare(c->ctx, (llama_seq_id) s)) {
-                throw std::runtime_error("failed to copy the prefix to sequence " + std::to_string(s));
-            }
+
+    // copies get their own recurrent cells right away, so that their states can be replaced
+    auto copy = [&](int src, int dst) {
+        llama_memory_seq_cp(mem, src, dst, -1, -1);
+        if (!llama_memory_seq_unshare(c->ctx, dst)) {
+            throw std::runtime_error("failed to copy the prefix to sequence " + std::to_string(dst));
+        }
+    };
+    const bool any = pos > 0;
+    for (int s = 0; s < ns && any; ++s) {
+        if (rep_s[s] == s && rep_t[s] != s) {
+            copy(rep_t[s], s);
+        }
+    }
+    for (int s = 0; s < ns; ++s) {
+        if (rep_s[s] == s && state_of(s)) {
+            set_state(c, s, state_of(s));
+        }
+    }
+    for (int s = 0; s < ns && any; ++s) {
+        if (rep_s[s] != s) {
+            copy(rep_s[s], s);
         }
     }
     return pos;
@@ -249,20 +281,14 @@ struct sp_seq_job {
 // one round: sequence s scores job s
 static void score_round(sp_ctx * c, const std::vector<sp_seq_job> & jobs, int n_soft, float temp) {
     const int ns = (int) jobs.size();
-    std::vector<const float *> embd(ns);
+    std::vector<const float *> embd(ns), states(ns);
     for (int s = 0; s < ns; ++s) {
-        embd[s] = jobs[s].theta;
+        embd[s]   = jobs[s].theta;
+        states[s] = jobs[s].state;
     }
     g_prof.start(c->ctx);
-    const llama_pos pos = prefix(c, embd, n_soft);
+    const llama_pos pos = prefix(c, embd, states, n_soft);
     g_prof.stop(c->ctx, sp_prof::PREFIX);
-    g_prof.start(c->ctx);
-    for (int s = 0; s < ns; ++s) {
-        if (jobs[s].state) {
-            set_state(c, s, jobs[s].state);
-        }
-    }
-    g_prof.stop(c->ctx, sp_prof::STATE);
 
     // logits at s0 .. n_dec-1 predict the response tokens; the last token is only a target
     std::vector<std::vector<llama_token>> toks(ns);
@@ -386,7 +412,7 @@ SP_API int64_t sp_n_state(const sp_ctx * c) { return c->n_state; }
 // the recurrent state after the prefix (before + soft prompt theta): out [n_state]
 SP_API int32_t sp_get_state(sp_ctx * c, const float * theta, int32_t n_soft, float * out) {
     try {
-        prefix(c, { theta }, n_soft);
+        prefix(c, { theta }, {}, n_soft);
         for (auto [il, n] : c->state_layers) {
             if (llama_memory_seq_state_get(c->ctx, 0, il, out) != n) {
                 throw std::runtime_error("failed to get the state of layer " + std::to_string(il));
@@ -496,8 +522,8 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, 
         llama_set_logprobs(c->ctx, 0.0f);
         if (g_prof.on) {
             const auto & t = g_prof.t;
-            fprintf(stderr, "sp_score: prefix %.2f s, state %.2f s, decode %.2f s, log-probs %.2f s;"
-                    " %lld decodes, %lld tokens, %lld outputs\n", t[0]*1e-6, t[1]*1e-6, t[2]*1e-6, t[3]*1e-6,
+            fprintf(stderr, "sp_score: prefix and states %.2f s, decode %.2f s, log-probs %.2f s;"
+                    " %lld decodes, %lld tokens, %lld outputs\n", t[0]*1e-6, t[1]*1e-6, t[2]*1e-6,
                     (long long) g_prof.n_dec, (long long) g_prof.n_tok, (long long) g_prof.n_out);
             g_prof = sp_prof();
             if (!g_op_prof.t.empty()) {
@@ -521,10 +547,7 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
         llama_set_logprobs(c->ctx, 0.0f); // sampling needs the logits
         for (int w0 = 0; w0 < n_prompts; w0 += c->n_seq) {
             const int ns = std::min(c->n_seq, n_prompts - w0);
-            const llama_pos pos0 = prefix(c, std::vector<const float *>(ns, theta), n_soft);
-            for (int s = 0; state && s < ns; ++s) {
-                set_state(c, s, state);
-            }
+            const llama_pos pos0 = prefix(c, std::vector<const float *>(ns, theta), std::vector<const float *>(ns, state), n_soft);
 
             std::vector<llama_sampler *> smpl(ns);
             for (int s = 0; s < ns; ++s) {
