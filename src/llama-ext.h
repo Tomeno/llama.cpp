@@ -147,6 +147,10 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API int64_t llama_memory_seq_state_get(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
 LLAMA_API int64_t llama_memory_seq_state_set(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * src);
 
+// gives seq_id its own recurrent cell now (device copy) when it shares one, e.g. right after llama_memory_seq_cp,
+// so that llama_memory_seq_state_set works before the next decode; false on error
+LLAMA_API bool llama_memory_seq_unshare(struct llama_context * ctx, llama_seq_id seq_id);
+
 // true for the layers of the model that keep a recurrent state (hybrid models: not the attention layers)
 LLAMA_API bool llama_model_layer_is_recr(const struct llama_model * model, int32_t il);
 

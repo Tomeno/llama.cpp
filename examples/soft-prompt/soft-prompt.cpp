@@ -136,8 +136,8 @@ static void decode_items(sp_ctx * c, const std::vector<sp_item> & items) {
     }
 }
 
-// decode a different soft prompt on every sequence
-static void decode_soft(sp_ctx * c, const std::vector<const float *> & embd, int n_soft, llama_pos pos0) {
+// decode soft prompt embd[k] on sequence seqs[k]
+static void decode_soft(sp_ctx * c, const std::vector<llama_seq_id> & seqs, const std::vector<const float *> & embd, int n_soft, llama_pos pos0) {
     const int ns = (int) embd.size();
     const int n  = n_soft * ns;
     llama_batch b = llama_batch_init(n, c->n_embd, 1);
@@ -157,7 +157,7 @@ static void decode_soft(sp_ctx * c, const std::vector<const float *> & embd, int
                 pos[(size_t) j*n + k] = c->n_pos == 1 || j < 3 ? pos0 + i : 0;
             }
             b.n_seq_id[k]  = 1;
-            b.seq_id[k][0] = s;
+            b.seq_id[k][0] = seqs[s];
             b.logits[k]    = false;
         }
     }
@@ -185,15 +185,31 @@ static int chunk(const sp_ctx * c, int ns) {
 }
 
 // clears the memory and processes the prefix (before + soft prompt) on sequences 0 .. embd.size()-1,
-// returns the next position
+// returns the next position; sequences with the same soft prompt (pointer) share one evaluation (seq_cp)
 static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, int n_soft) {
-    const int ns = (int) embd.size();
-    llama_memory_clear(llama_get_memory(c->ctx), true);
+    llama_memory_t mem = llama_get_memory(c->ctx);
+    llama_memory_clear(mem, true);
+
+    std::vector<llama_seq_id> seqs; // the first sequence of every distinct soft prompt
+    std::vector<const float *> uembd;
+    std::vector<llama_seq_id> src(embd.size());
+    for (size_t s = 0; s < embd.size(); ++s) {
+        const auto it = std::find(uembd.begin(), uembd.end(), embd[s]);
+        if (it == uembd.end()) {
+            src[s] = (llama_seq_id) s;
+            seqs.push_back((llama_seq_id) s);
+            uembd.push_back(embd[s]);
+        } else {
+            src[s] = seqs[it - uembd.begin()];
+        }
+    }
+    const int nu = (int) seqs.size();
+
     llama_pos pos = 0;
-    for (int i = 0; i < (int) c->before.size(); i += chunk(c, ns)) {
-        const int n = std::min(chunk(c, ns), (int) c->before.size() - i);
+    for (int i = 0; i < (int) c->before.size(); i += chunk(c, nu)) {
+        const int n = std::min(chunk(c, nu), (int) c->before.size() - i);
         std::vector<sp_item> items;
-        for (int s = 0; s < ns; ++s) {
+        for (llama_seq_id s : seqs) {
             for (int k = 0; k < n; ++k) {
                 items.push_back({ s, c->before[i + k], pos + k, false });
             }
@@ -201,14 +217,23 @@ static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, int
         decode_items(c, items);
         pos += n;
     }
-    for (int i = 0; i < n_soft; i += chunk(c, ns)) {
-        const int n = std::min(chunk(c, ns), n_soft - i);
-        std::vector<const float *> part(embd.size());
-        for (size_t s = 0; s < embd.size(); ++s) {
-            part[s] = embd[s] + (size_t) i*c->n_embd;
+    for (int i = 0; i < n_soft; i += chunk(c, nu)) {
+        const int n = std::min(chunk(c, nu), n_soft - i);
+        std::vector<const float *> part(nu);
+        for (int u = 0; u < nu; ++u) {
+            part[u] = uembd[u] + (size_t) i*c->n_embd;
         }
-        decode_soft(c, part, n, pos);
+        decode_soft(c, seqs, part, n, pos);
         pos += n;
+    }
+    // the copies get their own recurrent cells now, so that their states can be replaced
+    for (size_t s = 0; s < embd.size() && pos > 0; ++s) {
+        if (src[s] != (llama_seq_id) s) {
+            llama_memory_seq_cp(mem, src[s], (llama_seq_id) s, -1, -1);
+            if (!llama_memory_seq_unshare(c->ctx, (llama_seq_id) s)) {
+                throw std::runtime_error("failed to copy the prefix to sequence " + std::to_string(s));
+            }
+        }
     }
     return pos;
 }

@@ -419,6 +419,54 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+bool llama_memory_recurrent::seq_unshare(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || n_rs_seq != 0) {
+        return false;
+    }
+    const int32_t src = cells[seq_id].tail;
+    if (src < 0) {
+        return false;
+    }
+    if (cells[src].seq_id.size() == 1) {
+        return true;
+    }
+    int32_t dst = -1;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].is_empty()) {
+            dst = i;
+            break;
+        }
+    }
+    if (dst < 0) {
+        return false;
+    }
+
+    // copy the rows of every state tensor through views
+    ggml_init_params params = { 3*ggml_tensor_overhead(), nullptr, true };
+    for (const auto * tl : { &r_l, &s_l, &p_l }) {
+        for (ggml_tensor * t : *tl) {
+            if (!t) {
+                continue;
+            }
+            ggml_context * ctx = ggml_init(params);
+            ggml_tensor * a = ggml_view_1d(ctx, t, t->ne[0], src*t->nb[1]);
+            ggml_tensor * b = ggml_view_1d(ctx, t, t->ne[0], dst*t->nb[1]);
+            ggml_backend_view_init(a);
+            ggml_backend_view_init(b);
+            ggml_backend_tensor_copy(a, b);
+            ggml_free(ctx);
+        }
+    }
+
+    cells[src].seq_id.erase(seq_id);
+    cells[dst].pos = cells[src].pos;
+    cells[dst].src = dst;
+    cells[dst].seq_id.insert(seq_id);
+    cells[seq_id].tail = dst;
+    used += 1;
+    return true;
+}
+
 int64_t llama_memory_recurrent::seq_state_s(llama_seq_id seq_id, int32_t il, float * dst, const float * src) {
     if (il < 0 || il >= (int32_t) s_l.size() || s_l[il] == nullptr) {
         return 0;

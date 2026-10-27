@@ -201,10 +201,11 @@ harder task (or a weaker start) to see improvements over a normal prompt.
   checks the losses against a saved run.
 - EdgeRock 4B Q4_K_M, A4000, one state-tuning step (24 members x 8 examples, `--par 24`): 19.6 s before the RMA
   commit / read counts were made exact (every ubatch ran a full commit and two reads over 24 x 8 MB of records per
-  layer, also with nothing to commit), 11.2 s after; bit-identical results.
-- Every scoring job re-runs its prefix (before + soft prompt) and prompt; with many short jobs the per-call overhead
-  dominates (on a 4-core CPU a step of 128 jobs x ~25 tokens took ~150 s). Improvements: process the prefix once per
-  member and `seq_cp` it; process the prompt once per sample group; bigger batches.
+  layer, also with nothing to commit), 11.0 s after (bit-identical results), 9.8 s with the shared prefix (rounding
+  level changes: the prefix KV cells are shared).
+- Every distinct soft prompt of a round is evaluated once and copied to the other sequences (`seq_cp` plus
+  `llama_memory_seq_unshare`, so that their states can be replaced); state tuning evaluates a single prefix per round.
+  Prompts are still re-run per job; processing the prompt once per sample group would be the next step.
 - The log-softmax over the 248k vocabulary runs on the host for every scored token (`--max-outputs` rows per call).
   A GPU-side log-prob of the target token would remove the 0.5 GB logits copy per call.
 - Noise is generated on the host (numpy) and the members are copied in every call; fine for K x n_embd = 82k values.
