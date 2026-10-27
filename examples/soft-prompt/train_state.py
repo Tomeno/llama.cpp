@@ -100,11 +100,16 @@ def main():
 
     for step in range(1, args.steps + 1):
         t0 = time.time()
-        pop = es.population()
+        # the members' states straight from the noise: s0 + scale * (z +- sigma * eps)
+        d = es.noise() * (args.sigma * scale[:, None, None])
+        base = s0 + scale[:, None, None] * es.theta
+        st = np.empty((2 * args.pairs,) + s0.shape, dtype=np.float32)
+        np.add(base, d, out=st[0::2])
+        np.subtract(base, d, out=st[1::2])
         # both members of a pair see the same examples, so their difference cancels the example difficulty
         exs = [draw() for _ in range(args.examples)]
-        jobs = [(m, e) for m in range(len(pop)) for e in exs]
-        L = nll(eng, theta[None], jobs, states(pop))
+        jobs = [(m, e) for m in range(len(st)) for e in exs]
+        L = nll(eng, theta[None], jobs, st.reshape(len(st), -1))
         d0 = es.update(L)
         drift = float(np.sqrt(np.mean(es.theta ** 2)))
         print(f"step {step:5d}: train {L.mean():.5f} (population mean), |dL| {d0:.2e},"

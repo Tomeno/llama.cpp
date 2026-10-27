@@ -18,8 +18,8 @@ class ES:
         self.rng = np.random.default_rng(seed)
         self.eps = None
 
-    def population(self) -> np.ndarray:
-        """[2*pairs, ..., K, D]: theta + sigma*eps_i, theta - sigma*eps_i for every pair."""
+    def noise(self) -> np.ndarray:
+        """Draws the noise of a new population, [pairs, ..., K, D] (population() without the members)."""
         shape = self.theta.shape
         if self.rank <= 0:
             self.eps = self.rng.standard_normal((self.pairs,) + shape, dtype=np.float32)
@@ -27,7 +27,14 @@ class ES:
             # EGGROLL-style low-rank noise A B^T / sqrt(r) per matrix, unit variance per element
             a = self.rng.standard_normal((self.pairs,) + shape[:-1] + (self.rank,), dtype=np.float32)
             b = self.rng.standard_normal((self.pairs,) + shape[:-2] + (shape[-1], self.rank), dtype=np.float32)
-            self.eps = np.einsum("p...kr,p...dr->p...kd", a, b) / np.float32(np.sqrt(self.rank))
+            a *= np.float32(1 / np.sqrt(self.rank))
+            self.eps = np.matmul(a, np.swapaxes(b, -1, -2))
+        return self.eps
+
+    def population(self) -> np.ndarray:
+        """[2*pairs, ..., K, D]: theta + sigma*eps_i, theta - sigma*eps_i for every pair."""
+        shape = self.theta.shape
+        self.noise()
         pop = np.empty((2 * self.pairs,) + shape, dtype=np.float32)
         pop[0::2] = self.theta + self.sigma * self.eps
         pop[1::2] = self.theta - self.sigma * self.eps
