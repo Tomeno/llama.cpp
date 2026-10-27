@@ -99,7 +99,8 @@ int main(int argc, char ** argv) {
     cp.n_batch = 2048;
     cp.n_ubatch = 512;
     cp.n_seq_max = 2;
-    cp.kv_unified = true;
+    // per-sequence KV: with a unified cache the other sequence's cells change the attention reduction order (not bit-exact on CUDA)
+    cp.kv_unified = false;
     ctx = llama_init_from_model(model, cp);
     llama_memory_t mem = llama_get_memory(ctx);
 

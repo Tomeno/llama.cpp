@@ -37,8 +37,11 @@ def main():
 
     c = json.loads((args.ref / "config.json").read_text())
     L, H, FF = 8, 64, 96
+    # linear head dim 16: the smallest the CUDA gated delta net supports
+    LK, LKH, LV, LVH = 16, 2, 16, 4
+    QKV, Z = 2*LK*LKH + LV*LVH, LV*LVH
     c.update(hidden_size=H, num_attention_heads=4, num_key_value_heads=2, head_dim=16, intermediate_size=FF, num_hidden_layers=L,
-             linear_key_head_dim=8, linear_num_key_heads=2, linear_value_head_dim=8, linear_num_value_heads=4,
+             linear_key_head_dim=LK, linear_num_key_heads=LKH, linear_value_head_dim=LV, linear_num_value_heads=LVH,
              fixed_memory_swa_layers=[3, 7], fixed_memory_swa_window=16,
              independent_memory={"admission_rank": 8, "capacity": 8, "max_commit_chunk": 4, "writer_intermediate_size": 32},
              layer_types=(["linear_attention"] * 3 + ["full_attention"]) * 2)
@@ -59,11 +62,11 @@ def main():
         w[p + "mlp.gate_proj.weight"], w[p + "mlp.up_proj.weight"], w[p + "mlp.down_proj.weight"] = r(FF, H), r(FF, H), r(H, FF)
         if c["layer_types"][i] == "linear_attention":
             q = p + "linear_attn."
-            w[q + "in_proj_qkv.weight"], w[q + "in_proj_z.weight"] = r(64, H), r(32, H)
-            w[q + "in_proj_b.weight"], w[q + "in_proj_a.weight"] = r(4, H), r(4, H)
-            w[q + "conv1d.weight"], w[q + "dt_bias"], w[q + "A_log"] = r(64, 1, 4, std=0.3), r(4, std=1), r(4, std=1)
-            w[q + "norm.weight"] = (1 + r(8, std=0.1).float()).to(torch.bfloat16)
-            w[q + "out_proj.weight"] = r(H, 32)
+            w[q + "in_proj_qkv.weight"], w[q + "in_proj_z.weight"] = r(QKV, H), r(Z, H)
+            w[q + "in_proj_b.weight"], w[q + "in_proj_a.weight"] = r(LVH, H), r(LVH, H)
+            w[q + "conv1d.weight"], w[q + "dt_bias"], w[q + "A_log"] = r(QKV, 1, 4, std=0.3), r(LVH, std=1), r(LVH, std=1)
+            w[q + "norm.weight"] = (1 + r(LV, std=0.1).float()).to(torch.bfloat16)
+            w[q + "out_proj.weight"] = r(H, Z)
         else:
             q = p + "self_attn."
             w[q + "q_proj.weight"], w[q + "k_proj.weight"], w[q + "v_proj.weight"], w[q + "o_proj.weight"] = r(128, H), r(32, H), r(32, H), r(H, 64)

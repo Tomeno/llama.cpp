@@ -387,7 +387,8 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
         ggml_tensor * cand_s = ggml_concat(ctx0, masked_score(st.s, st.f),
                 ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, ext_s, idx), P, G, S), 0);           // [C + P, G, S]
 
-        ggml_tensor * top = ggml_top_k(ctx0, cand_s, C);                                       // [C, G, S]
+        // argsort instead of top_k: the order of the kept records must not depend on the backend run (CUDA top_k is unordered)
+        ggml_tensor * top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, cand_s, C));              // [C, G, S]
 
         ggml_tensor * new_k = ggml_get_rows(ctx0, cand_k, top);
         ggml_tensor * new_v = ggml_get_rows(ctx0, cand_v, top);

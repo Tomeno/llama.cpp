@@ -2,7 +2,7 @@
 
 Start here. This documents the EdgeRock support on this branch, how it was verified, how to control its state and
 caches, what was learned about the model, and the soft prompt tuning work built on top. Everything was developed and
-tested on a 4-core CPU without a GPU; the first thing to do on a GPU machine is the checklist in "Next steps".
+tested on a 4-core CPU without a GPU; GPU results are in "Next steps".
 
 - Model: <https://huggingface.co/rockmatrix-ai/EdgeRock> (reference Python code, `modeling_edgerock.py`)
 - GGUFs: <https://huggingface.co/hkust-aaron/EdgeRock-4B-GGUF> (their `backend/` folder holds the official llama.cpp
@@ -194,15 +194,31 @@ From `llama-server`:
 
 ## Next steps
 
-GPU checklist (nothing has run on a GPU yet):
+GPU results (RTX A4000 16 GB, CUDA 13.4, `-DCMAKE_CUDA_ARCHITECTURES=86`):
 
-1. `llama-completion` smoke test with `-ngl 99`; then `llama-perplexity -c 2048 --chunks 2` on any text and compare
-   with a CPU run (`-ngl 0`): the numbers should agree to ~0.1%. If the CUDA backend lacks an op the RMA graph uses
-   (`top_k`, 4-D `get_rows`, `pad`, `scale_bias`, `step`), the scheduler falls back to the CPU per op (slow, still
-   correct); check the log for that.
-2. `llama-edgerock-state-test` on the GPU.
-3. `examples/soft-prompt`: `train_nll.py --eval-only` from text vs the same text as `--before` (must agree), then
-   the arithmetic sanity check, then `probe.py` on simple prompts.
+| check | result |
+| - | - |
+| smoke test, Q4_K_M | "Paris. Paris is known for ...", 57 tokens/s generation |
+| CPU fallback | none: 2 graph splits (embedding lookup + rest), every RMA op runs on CUDA |
+| perplexity GPU vs CPU (`-dev none`), 2 x 2048 tokens | BF16: 8.1659 vs 8.1686 (0.03%); Q4_K_M: 8.3953 vs 8.3788 (quantized kernels differ) |
+| `llama-edgerock-state-test`, 700 tokens | bit-exact on GPU and CPU |
+| RMA module vs reference (BF16) | GPU: mean rel. error ~1e-3, max 4e-2; CPU on the same machine: 3e-4 / 2e-3 |
+| tiny model vs reference | CPU: <= 1.5e-3, argmax 120/120 for every batch shape; GPU: 1.2e-3 token by token, 1.6e-2 (ub 512) and 5.4e-2 (ub 7, argmax 119/120) batched |
+| soft prompt from text vs the same text as `--before` | identical val NLL |
+| arithmetic ES, 40 steps x 16 members x 8 examples | val NLL 0.705 -> 0.315, greedy accuracy 56.2% -> 71.9%, ~4 s per step |
+| `probe.py`, 32 simple prompts x 4 samples, 256 tokens | meta-talk in 65.6% of samples, 30 of 32 groups with a reward spread |
+
+Fixed on the way:
+
+- CUDA `top_k` returns the kept records in a different order every run (its radix path places them with atomics), so the RMA bank order and the read summation order changed between runs (~0.4 logit drift on Q4_K_M after the first commit). The commit now uses `ggml_argsort_top_k`.
+- The state test used a unified KV cache; there the other sequence's cells change the attention reduction order (not bit-exact on CUDA, rounding level: <= 0.08 logits on BF16). It now uses per-sequence KV.
+- `make_tiny.py` used linear head dim 8; the CUDA gated delta net supports 16, 32, 64, 128 only. It now uses 16.
+
+Known:
+
+- llama.cpp runs F32 matmuls in TF32 on Ampere+ (cuBLAS math mode in `common.cuh`, and the `mmf` kernel's TF32 mma for small batches). This is the larger GPU error of the RMA read (F32 x F32) and of the F32 tiny model in batches. `NVIDIA_TF32_OVERRIDE=0` turns off the cuBLAS part only.
+- Past the window (e.g. 1300 tokens), state restores are not bit-exact on GPU or CPU (BF16: 0.0027 logits, tokens match); `seq_cp` is. Likely the different window cell order after a restore; not proven.
+- The arithmetic numbers in the soft-prompt README were measured on multiplication-only data; `make_data.py arith` mixes `*`, `+`, `-`.
 
 Open work:
 
