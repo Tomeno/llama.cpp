@@ -51,23 +51,39 @@ def _load_lib(path: str) -> ctypes.CDLL:
     for f in ("sp_n_embd", "sp_n_vocab", "sp_n_seq"):
         getattr(lib, f).argtypes = [ctypes.c_void_p]
         getattr(lib, f).restype = ctypes.c_int32
+    lib.sp_n_state.argtypes = [ctypes.c_void_p]
+    lib.sp_n_state.restype = ctypes.c_int64
+    lib.sp_get_state.argtypes = [ctypes.c_void_p, _f32p, ctypes.c_int32, _f32p]
     lib.sp_is_eog.argtypes = [ctypes.c_void_p, ctypes.c_int32]
     lib.sp_tokenize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, _i32p, ctypes.c_int32]
     lib.sp_detokenize.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32]
     lib.sp_set_before.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32]
     lib.sp_token_embeddings.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32, _f32p]
-    lib.sp_score.argtypes = [ctypes.c_void_p, _f32p, ctypes.c_int32, _i32p, ctypes.c_int32,
+    lib.sp_score.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, _i32p, ctypes.c_int32,
                              _i32p, _i64p, _i32p, _i32p, _i64p, _i32p, ctypes.c_float, _f32p]
-    lib.sp_generate.argtypes = [ctypes.c_void_p, _f32p, ctypes.c_int32, ctypes.c_int32,
+    lib.sp_generate.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, ctypes.c_int32,
                                 _i32p, _i64p, _i32p, ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
                                 ctypes.c_uint64, _i32p, _i32p, _i32p]
-    for f in ("sp_score", "sp_generate", "sp_token_embeddings"):
+    for f in ("sp_score", "sp_generate", "sp_token_embeddings", "sp_get_state"):
         getattr(lib, f).restype = ctypes.c_int32
     return lib
 
 
 def _ptr(a: np.ndarray, t):
     return a.ctypes.data_as(t)
+
+
+def _opt(a: np.ndarray | None):
+    return a.ctypes.data_as(_f32p) if a is not None else None
+
+
+def _states(states, n_state: int) -> np.ndarray | None:
+    if states is None:
+        return None
+    st = np.ascontiguousarray(states, dtype=np.float32)
+    if st.shape[-1] != n_state:
+        raise ValueError(f"states have {st.shape[-1]} values, the model {n_state}")
+    return st
 
 
 def _pack(seqs: Sequence[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -91,6 +107,7 @@ class Engine:
         self.n_embd  = self.lib.sp_n_embd(self.ctx)
         self.n_vocab = self.lib.sp_n_vocab(self.ctx)
         self.n_seq   = self.lib.sp_n_seq(self.ctx)
+        self.n_state = self.lib.sp_n_state(self.ctx)
 
     def close(self):
         if self.ctx:
@@ -136,35 +153,49 @@ class Engine:
         self._check(self.lib.sp_token_embeddings(self.ctx, _ptr(t, _i32p), len(t), _ptr(out, _f32p)))
         return out
 
+    def get_state(self, theta: np.ndarray) -> np.ndarray:
+        """The recurrent state [n_state] after the prefix with the soft prompt theta."""
+        th = np.ascontiguousarray(theta, dtype=np.float32)
+        out = np.zeros(self.n_state, dtype=np.float32)
+        self._check(self.lib.sp_get_state(self.ctx, _ptr(th, _f32p), th.shape[0] if th.size else 0, _ptr(out, _f32p)))
+        return out
+
     def score(self, thetas: np.ndarray, theta_idx: Sequence[int], posts: Sequence[np.ndarray], resps: Sequence[np.ndarray],
-              temp: float = 1.0) -> list[np.ndarray]:
+              temp: float = 1.0, states: np.ndarray | None = None) -> list[np.ndarray]:
         """Teacher-forced log-probs of resps[j] after posts[j] with the soft prompt thetas[theta_idx[j]].
 
-        thetas: [n_theta, K, n_embd] float32; returns one array of len(resps[j]) log-probs per job."""
+        thetas: [n_theta, K, n_embd] float32; states: None or [n_theta, n_state], the recurrent state that replaces the
+        one after the prefix; returns one array of len(resps[j]) log-probs per job."""
         th = np.ascontiguousarray(thetas, dtype=np.float32)
         if th.ndim == 2:
             th = th[None]
+        st = _states(states, self.n_state)
+        if st is not None and st.ndim == 1:
+            st = st[None]
+        if st is not None and len(st) != len(th):
+            th = np.ascontiguousarray(np.broadcast_to(th, (len(st),) + th.shape[1:]))
         n_soft = th.shape[1]
         idx = np.ascontiguousarray(theta_idx, dtype=np.int32)
         pf, po, pl = _pack(posts)
         rf, ro, rl = _pack(resps)
         out = np.zeros(len(rf), dtype=np.float32)
-        self._check(self.lib.sp_score(self.ctx, _ptr(th, _f32p), n_soft, _ptr(idx, _i32p), len(idx),
+        self._check(self.lib.sp_score(self.ctx, _ptr(th, _f32p), _opt(st), n_soft, _ptr(idx, _i32p), len(idx),
                                       _ptr(pf, _i32p), _ptr(po, _i64p), _ptr(pl, _i32p),
                                       _ptr(rf, _i32p), _ptr(ro, _i64p), _ptr(rl, _i32p), float(temp), _ptr(out, _f32p)))
         return [out[o:o + n] for o, n in zip(ro, rl)]
 
     def generate(self, theta: np.ndarray, posts: Sequence[np.ndarray], max_new: int, temp: float = 0.6, top_p: float = 0.95,
-                 top_k: int = 20, seed: int = 0) -> list[tuple[np.ndarray, bool]]:
+                 top_k: int = 20, seed: int = 0, state: np.ndarray | None = None) -> list[tuple[np.ndarray, bool]]:
         """Samples a response for every prompt; returns (tokens, finished) pairs (temp <= 0: greedy)."""
         th = np.ascontiguousarray(theta, dtype=np.float32)
+        st = _states(state, self.n_state)
         n_soft = th.shape[0] if th.size else 0
         pf, po, pl = _pack(posts)
         n = len(posts)
         toks = np.zeros((n, max_new), dtype=np.int32)
         lens = np.zeros(n, dtype=np.int32)
         fin = np.zeros(n, dtype=np.int32)
-        self._check(self.lib.sp_generate(self.ctx, _ptr(th, _f32p), n_soft, n, _ptr(pf, _i32p), _ptr(po, _i64p), _ptr(pl, _i32p),
+        self._check(self.lib.sp_generate(self.ctx, _ptr(th, _f32p), _opt(st), n_soft, n, _ptr(pf, _i32p), _ptr(po, _i64p), _ptr(pl, _i32p),
                                          max_new, float(temp), float(top_p), int(top_k), int(seed) & (2**64 - 1),
                                          _ptr(toks, _i32p), _ptr(lens, _i32p), _ptr(fin, _i32p)))
         return [(toks[i, :lens[i]].copy(), bool(fin[i])) for i in range(n)]
@@ -196,6 +227,29 @@ def save_soft_prompt(path: str, theta: np.ndarray, tpl: Template, meta: dict | N
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
+
+
+def save_state(path: str, theta: np.ndarray, state: np.ndarray, tpl: Template, meta: dict | None = None):
+    """A soft prompt file that also holds the recurrent state that replaces the one after the prefix."""
+    w = gguf.GGUFWriter(path, "soft_prompt")
+    w.add_string("soft_prompt.before", tpl.before)
+    w.add_string("soft_prompt.after", tpl.after)
+    w.add_string("soft_prompt.example", tpl.example)
+    w.add_string("soft_prompt.meta", json.dumps(meta or {}))
+    w.add_tensor("soft_prompt.embd", np.ascontiguousarray(theta, dtype=np.float32))
+    w.add_tensor("soft_prompt.state", np.ascontiguousarray(state, dtype=np.float32).reshape(-1))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def load_state(path: str | None) -> np.ndarray | None:
+    """The recurrent state of a soft prompt file, None if it has none."""
+    if not path:
+        return None
+    t = next((t for t in gguf.GGUFReader(path).tensors if t.name == "soft_prompt.state"), None)
+    return np.array(t.data, dtype=np.float32).reshape(-1) if t is not None else None
 
 
 def load_soft_prompt(path: str) -> tuple[np.ndarray, Template, dict]:

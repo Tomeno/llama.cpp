@@ -419,6 +419,39 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+int64_t llama_memory_recurrent::seq_state_s(llama_seq_id seq_id, int32_t il, float * dst, const float * src) {
+    if (il < 0 || il >= (int32_t) s_l.size() || s_l[il] == nullptr) {
+        return 0;
+    }
+    ggml_tensor * s = s_l[il];
+    const int64_t n = hparams.n_embd_s(il);
+    if (dst == nullptr && src == nullptr) {
+        return n;
+    }
+    // with rollback snapshots the current row is not the cell's own
+    if (s->type != GGML_TYPE_F32 || n_rs_seq != 0) {
+        return -1;
+    }
+    int32_t cell = -1;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].has_seq_id(seq_id)) {
+            if (cell >= 0 || cells[i].seq_id.size() != 1) {
+                return -1;
+            }
+            cell = i;
+        }
+    }
+    if (cell < 0) {
+        return -1;
+    }
+    if (dst) {
+        ggml_backend_tensor_get(s, dst, cell * s->nb[1], n * sizeof(float));
+    } else {
+        ggml_backend_tensor_set(s, src, cell * s->nb[1], n * sizeof(float));
+    }
+    return n;
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);

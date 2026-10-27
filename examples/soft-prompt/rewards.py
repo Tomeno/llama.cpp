@@ -35,6 +35,8 @@ class RewardConfig:
     overlong: int = 0        # DAPO soft overlong penalty over the last N tokens before the budget (0: off)
     answer_mode: str = "final"  # final: extracted answer after </think> equals the reference; contains: the reference appears
                                 # as a word after </think>; prefix: the response starts with the reference (continuation)
+    min_think: int = 0       # thinking shorter than this many tokens is penalized, linearly (0: off)
+    w_short: float = 1.0     # empty thinking scores 0 on every other term, so this keeps "stop thinking" from winning
 
     def __post_init__(self):
         self._re = [re.compile(p, re.IGNORECASE) for p in self.patterns]
@@ -128,7 +130,10 @@ def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: Rewar
         "correct": None,
         "r_len": 0.0,
         "r_overlong": 0.0,
+        "r_short": 0.0,
     }
+    if cfg.min_think > 0 and think_toks is not None and len(think_toks) < cfg.min_think:
+        out["r_short"] = (len(think_toks) - cfg.min_think) / cfg.min_think
     if answer:
         if cfg.answer_mode == "prefix":
             out["correct"] = starts_with_answer(text, answer)
@@ -152,7 +157,7 @@ def group_length_reward(group: list[dict], lengths: list[int]):
 def finish(r: dict, cfg: RewardConfig, extra: float = 0.0) -> float:
     r["reward"] = (-cfg.w_meta * r["meta_frac"] - cfg.w_any * float(r["meta_any"]) - cfg.w_rep * r["rep_frac"] - cfg.w_loop * r["loop_frac"]
                    + (cfg.w_correct * float(r["correct"]) if r["correct"] is not None else 0.0)
-                   + cfg.w_len * r["r_len"] + r["r_overlong"] + extra)
+                   + cfg.w_len * r["r_len"] + r["r_overlong"] + cfg.w_short * r["r_short"] + extra)
     return r["reward"]
 
 
@@ -166,6 +171,8 @@ def add_reward_args(ap):
     g.add_argument("--w-correct", type=float, default=1.0)
     g.add_argument("--w-len", type=float, default=0.0, help="group length reward for correct answers")
     g.add_argument("--overlong", type=int, default=0, help="DAPO soft overlong penalty over the last N tokens (0: off)")
+    g.add_argument("--min-think", type=int, default=0, help="penalize thinking shorter than N tokens, linearly (0: off)")
+    g.add_argument("--w-short", type=float, default=1.0, help="weight of the --min-think penalty (-1 for empty thinking)")
     g.add_argument("--answer-mode", choices=["final", "contains", "prefix"], default="final",
                    help="final: the extracted answer after </think> equals the reference; contains: the reference appears as a"
                         " word after </think>; prefix: the response starts with the reference (continuation)")
@@ -174,4 +181,4 @@ def add_reward_args(ap):
 def config_from_args(args) -> RewardConfig:
     pats = RewardConfig.load_patterns(args.patterns) if args.patterns else list(DEFAULT_PATTERNS)
     return RewardConfig(pats, args.w_meta, args.w_any, args.w_rep, args.w_loop, args.w_correct, args.w_len, args.overlong,
-                        args.answer_mode)
+                        args.answer_mode, args.min_think, args.w_short)

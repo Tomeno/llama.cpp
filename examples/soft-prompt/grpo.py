@@ -120,7 +120,7 @@ def main():
             pop = es.population()
             n_m = len(pop)
             idx = [m for m in range(n_m) for _ in kept]
-            lp = eng.score(pop, idx, posts * n_m, resps * n_m, args.temp)
+            lp = es_mod.score_population(eng, pop, idx, posts * n_m, resps * n_m, args.temp)
             J = np.zeros(n_m)
             for k, cur in enumerate(lp):
                 m, i = divmod(k, len(kept))

@@ -64,6 +64,10 @@ public:
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+
+    // reads (dst) or writes (src) the s row of layer il of the cell that holds seq_id alone, F32 only;
+    // returns the row size in floats, 0 if the layer has no state, -1 on error
+    int64_t seq_state_s(llama_seq_id seq_id, int32_t il, float * dst, const float * src);
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())

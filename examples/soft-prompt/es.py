@@ -1,4 +1,4 @@
-"""Antithetic evolution strategies with Adam, on a soft prompt [K, n_embd]."""
+"""Antithetic evolution strategies with Adam, on a soft prompt [K, n_embd] (or a stack of matrices [..., K, D])."""
 
 from __future__ import annotations
 
@@ -19,16 +19,16 @@ class ES:
         self.eps = None
 
     def population(self) -> np.ndarray:
-        """[2*pairs, K, n_embd]: theta + sigma*eps_i, theta - sigma*eps_i for every pair."""
-        K, D = self.theta.shape
+        """[2*pairs, ..., K, D]: theta + sigma*eps_i, theta - sigma*eps_i for every pair."""
+        shape = self.theta.shape
         if self.rank <= 0:
-            self.eps = self.rng.standard_normal((self.pairs, K, D), dtype=np.float32)
+            self.eps = self.rng.standard_normal((self.pairs,) + shape, dtype=np.float32)
         else:
-            # EGGROLL-style low-rank noise A B^T / sqrt(r), unit variance per element
-            a = self.rng.standard_normal((self.pairs, K, self.rank), dtype=np.float32)
-            b = self.rng.standard_normal((self.pairs, D, self.rank), dtype=np.float32)
-            self.eps = np.einsum("pkr,pdr->pkd", a, b) / np.sqrt(self.rank)
-        pop = np.empty((2 * self.pairs, K, D), dtype=np.float32)
+            # EGGROLL-style low-rank noise A B^T / sqrt(r) per matrix, unit variance per element
+            a = self.rng.standard_normal((self.pairs,) + shape[:-1] + (self.rank,), dtype=np.float32)
+            b = self.rng.standard_normal((self.pairs,) + shape[:-2] + (shape[-1], self.rank), dtype=np.float32)
+            self.eps = np.einsum("p...kr,p...dr->p...kd", a, b) / np.float32(np.sqrt(self.rank))
+        pop = np.empty((2 * self.pairs,) + shape, dtype=np.float32)
         pop[0::2] = self.theta + self.sigma * self.eps
         pop[1::2] = self.theta - self.sigma * self.eps
         return pop
@@ -50,6 +50,22 @@ class ES:
         vhat = self.v / (1 - self.beta2 ** self.t)
         self.theta -= self.lr * mhat / (np.sqrt(vhat) + 1e-8)
         return d0
+
+
+def score_population(eng, pop: np.ndarray, idx, posts, resps, *args, **kw) -> list[np.ndarray]:
+    """eng.score for the members of population(): job k runs member idx[k], members 2p / 2p+1 must have the same jobs
+    in the same order. Every round of n_seq jobs of + members is followed by the - members in the same sequence slots:
+    with quantized weights a job's result depends on its slot (batch layout), and this way that cancels within a pair."""
+    idx = np.asarray(idx)
+    plus, minus = np.flatnonzero(idx % 2 == 0), np.flatnonzero(idx % 2 == 1)
+    assert len(plus) == len(minus)
+    order = np.concatenate([np.concatenate([plus[k:k + eng.n_seq], minus[k:k + eng.n_seq]])
+                            for k in range(0, len(plus), eng.n_seq)]) if len(plus) else plus
+    lp = eng.score(pop, idx[order], [posts[k] for k in order], [resps[k] for k in order], *args, **kw)
+    out = [None] * len(idx)
+    for k, x in zip(order, lp):
+        out[k] = x
+    return out
 
 
 def add_es_args(ap, steps: int = 200):

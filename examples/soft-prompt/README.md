@@ -191,10 +191,17 @@ harder task (or a weaker start) to see improvements over a normal prompt.
   quantized kernels themselves depend on the batch shape)
 - ES lowers held-out NLL on a toy model and on EdgeRock-4B (arithmetic, above: 0.402 -> 0.077, accuracy 71.9% -> 93.8%)
 - probe and grpo run end to end (toy model); GRPO has not been run on the real model yet
-- CPU only; CUDA is untested (see `docs/edgerock.md`, "GPU")
+- CUDA (RTX A4000): the text-init equivalence, the arithmetic ES run and `probe.py` work; ~4 s per arithmetic ES step (see `docs/edgerock.md`, "Next steps")
 
 ## Performance notes and possible improvements
 
+- `SP_PROFILE=1` prints the wall time of the scoring phases (prefix, state, decode, logits, softmax) after every
+  `sp_score` call; `SP_PROFILE=2` also times every graph node by op (it synchronizes after each node, so the totals
+  are inflated, but the ranking holds). `runs/meta-talk/prof/bench_score.py` is a fixed workload (one ES step) that
+  checks the losses against a saved run.
+- EdgeRock 4B Q4_K_M, A4000, one state-tuning step (24 members x 8 examples, `--par 24`): 19.6 s before the RMA
+  commit / read counts were made exact (every ubatch ran a full commit and two reads over 24 x 8 MB of records per
+  layer, also with nothing to commit), 11.2 s after; bit-identical results.
 - Every scoring job re-runs its prefix (before + soft prompt) and prompt; with many short jobs the per-call overhead
   dominates (on a 4-core CPU a step of 128 jobs x ~25 tokens took ~150 s). Improvements: process the prefix once per
   member and `seq_cp` it; process the prompt once per sample group; bigger batches.

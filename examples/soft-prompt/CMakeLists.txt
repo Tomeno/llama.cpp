@@ -5,4 +5,5 @@ set_target_properties(${TARGET} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINA
                                            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 install(TARGETS ${TARGET} LIBRARY)
 target_link_libraries(${TARGET} PRIVATE llama ggml ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ../../src) # llama-ext.h
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

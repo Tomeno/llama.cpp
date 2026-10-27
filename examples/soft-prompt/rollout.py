@@ -37,9 +37,10 @@ def think_tokens(eng: Engine, toks: np.ndarray) -> int:
 
 
 def rollout(eng: Engine, theta: np.ndarray, prompts: Prompts, ids: list[int], max_new: int, cfg: rewards.RewardConfig,
-            sampling: dict, seed: int, reward_cmd: str | None = None) -> list[dict]:
-    """One sample per entry of ids (indices into prompts), with rewards; samples of the same prompt form a group."""
-    gen = eng.generate(theta, [prompts.posts[i] for i in ids], max_new, seed=seed, **sampling)
+            sampling: dict, seed: int, reward_cmd: str | None = None, state: np.ndarray | None = None) -> list[dict]:
+    """One sample per entry of ids (indices into prompts), with rewards; samples of the same prompt form a group.
+    state: the recurrent state after the prefix (initial state tuning), None: the one the soft prompt leaves."""
+    gen = eng.generate(theta, [prompts.posts[i] for i in ids], max_new, seed=seed, state=state, **sampling)
     samples = []
     for pi, (toks, fin) in zip(ids, gen):
         text = eng.detokenize(toks)
@@ -79,7 +80,8 @@ def sample_row(s: dict, prompts: Prompts) -> dict:
     row = prompts.rows[s["prompt"]]
     return {"prompt": row["prompt"], "answer": row.get("answer"), "response": s["text"], "finished": s["finished"],
             "tokens": s["tokens"], "think_tokens": s["think_tokens"], "meta_frac": s["meta_frac"], "meta_any": s["meta_any"],
-            "rep_frac": s["rep_frac"], "loop_frac": s["loop_frac"], "correct": s["correct"], "reward": s.get("reward")}
+            "rep_frac": s["rep_frac"], "loop_frac": s["loop_frac"], "r_short": s["r_short"], "correct": s["correct"],
+            "reward": s.get("reward")}
 
 
 def summary(samples: list[dict]) -> str:
@@ -87,7 +89,8 @@ def summary(samples: list[dict]) -> str:
     m = lambda k: sum(float(s[k]) for s in samples) / n  # noqa: E731
     out = (f"reward {m('reward'):.4f} | meta-talk {100 * m('meta_any'):.1f}% ({m('meta_frac'):.3f} of sentences)"
            f" | repetition {100 * sum(s['rep_frac'] > 0 for s in samples) / n:.1f}% | loops {m('loop_frac'):.3f}"
-           f" | think {m('think_tokens'):.0f} / {m('tokens'):.0f} tokens | finished {100 * m('finished'):.1f}%")
+           f" | think {m('think_tokens'):.0f} / {m('tokens'):.0f} tokens | finished {100 * m('finished'):.1f}%"
+           f" | short thinking {100 * sum(s['r_short'] < 0 for s in samples) / n:.1f}%")
     ref = [s for s in samples if s["correct"] is not None]
     if ref:
         out += f" | correct {100 * sum(s['correct'] for s in ref) / len(ref):.1f}% ({len(ref)})"

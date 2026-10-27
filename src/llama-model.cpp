@@ -3831,6 +3831,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+bool llama_model_layer_is_recr(const struct llama_model * model, int32_t il) {
+    return il >= 0 && (uint32_t) il < model->hparams.n_layer() && model->hparams.is_recr(il);
+}
+
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }

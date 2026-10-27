@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -4365,6 +4368,38 @@ struct ggml_cgraph * llama_graph_reserve(
         mctx = memory->init_full();
     }
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+}
+
+static llama_memory_recurrent * get_mem_recr(llama_context * ctx) {
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * m = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return m;
+    }
+    if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return m->get_mem_recr();
+    }
+    if (auto * m = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return m->get_mem_recr();
+    }
+    return nullptr;
+}
+
+int64_t llama_memory_seq_state_get(llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst) {
+    auto * mem = get_mem_recr(ctx);
+    if (!mem) {
+        return 0;
+    }
+    ctx->synchronize();
+    return mem->seq_state_s(seq_id, il, dst, nullptr);
+}
+
+int64_t llama_memory_seq_state_set(llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * src) {
+    auto * mem = get_mem_recr(ctx);
+    if (!mem) {
+        return 0;
+    }
+    ctx->synchronize();
+    return mem->seq_state_s(seq_id, il, nullptr, src);
 }
 
 // llama adapter API

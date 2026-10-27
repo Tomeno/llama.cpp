@@ -7,20 +7,25 @@
 // The library evaluates many soft prompts at once, one per sequence of a single context:
 //   - sp_score:    log-probs of given responses (teacher forcing), every job with its own soft prompt
 //   - sp_generate: sampled responses, every prompt with the same soft prompt
+// Optionally the recurrent state after the prefix is replaced too (initial state tuning, see sp_get_state).
 // Everything else (rewards, ES, Adam, data, training loops) lives in the Python scripts next to this file.
 
 #include "soft-prompt.h"
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "ggml.h"
 #include "gguf.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -47,9 +52,65 @@ struct sp_ctx {
     int32_t max_outputs = 512;
 
     std::vector<llama_token> before;
+
+    std::vector<std::pair<int32_t, int64_t>> state_layers; // (layer, floats) of the recurrent states
+    int64_t n_state = 0;
 };
 
 static std::string g_error;
+
+// phase timing (SP_PROFILE=1): synchronizes after every phase and prints a summary after every sp_score call
+struct sp_prof {
+    enum { PREFIX, STATE, DECODE, LOGITS, SOFTMAX, N };
+    bool    on = getenv("SP_PROFILE") != nullptr;
+    int64_t t[N] = {};
+    int64_t n_dec = 0, n_tok = 0, n_out = 0;
+    int64_t t0 = 0;
+    void start(llama_context * ctx) { if (on) { llama_synchronize(ctx); t0 = ggml_time_us(); } }
+    void stop(llama_context * ctx, int phase) { if (on) { llama_synchronize(ctx); const int64_t t1 = ggml_time_us(); t[phase] += t1 - t0; t0 = t1; } }
+};
+static sp_prof g_prof;
+
+// per-op timing (SP_PROFILE=2): the scheduler synchronizes after every observed node (fusion is off, so totals are inflated)
+struct sp_op_prof {
+    std::map<std::string, std::pair<int64_t, int64_t>> t; // "op name" -> (us, count)
+    int64_t t0 = 0;
+};
+static sp_op_prof g_op_prof;
+
+static bool op_prof_cb(ggml_tensor * t, bool ask, void *) {
+    const int64_t now = ggml_time_us();
+    if (ask) {
+        g_op_prof.t0 = now;
+        return true;
+    }
+    std::string name = t->name;
+    name.erase(std::find_if(name.begin(), name.end(), [](char ch) { return ch == '-' || ch == ' ' || ch == '('; }), name.end());
+    while (!name.empty() && isdigit((unsigned char) name.back())) {
+        name.pop_back();
+    }
+    for (const std::string & k : { std::string(ggml_op_desc(t)), std::string(ggml_op_desc(t)) + " " + name }) {
+        auto & e = g_op_prof.t[k];
+        e.first += now - g_op_prof.t0;
+        e.second++;
+    }
+    return true;
+}
+
+static void op_prof_print() {
+    std::vector<std::pair<std::string, std::pair<int64_t, int64_t>>> v(g_op_prof.t.begin(), g_op_prof.t.end());
+    std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.first > b.second.first; });
+    int64_t tot = 0;
+    for (auto & x : v) {
+        tot += x.first.find(' ') == std::string::npos ? x.second.first : 0;
+    }
+    fprintf(stderr, "ops: %.2f s total\n", tot*1e-6);
+    for (size_t i = 0; i < std::min<size_t>(v.size(), 60); ++i) {
+        fprintf(stderr, "  %6.2f s %5.1f%% %7lld x  %s\n", v[i].second.first*1e-6, 100.0*v[i].second.first/tot,
+                (long long) v[i].second.second, v[i].first.c_str());
+    }
+    g_op_prof = sp_op_prof();
+}
 
 struct sp_item {
     llama_seq_id seq;
@@ -108,6 +169,16 @@ static void decode_soft(sp_ctx * c, const std::vector<const float *> & embd, int
     }
 }
 
+// replaces the recurrent state of sequence s ([n_state] floats, layer after layer)
+static void set_state(sp_ctx * c, llama_seq_id s, const float * state) {
+    for (auto [il, n] : c->state_layers) {
+        if (llama_memory_seq_state_set(c->ctx, s, il, state) != n) {
+            throw std::runtime_error("failed to set the state of layer " + std::to_string(il));
+        }
+        state += n;
+    }
+}
+
 // tokens per sequence that fit in one batch
 static int chunk(const sp_ctx * c, int ns) {
     return std::max(1, c->n_batch / ns);
@@ -144,6 +215,7 @@ static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, int
 
 struct sp_seq_job {
     const float       * theta;
+    const float       * state; // nullptr: the state the prefix leaves
     const llama_token * post;
     int                 n_post;
     const llama_token * resp;
@@ -158,7 +230,16 @@ static void score_round(sp_ctx * c, const std::vector<sp_seq_job> & jobs, int n_
     for (int s = 0; s < ns; ++s) {
         embd[s] = jobs[s].theta;
     }
+    g_prof.start(c->ctx);
     const llama_pos pos = prefix(c, embd, n_soft);
+    g_prof.stop(c->ctx, sp_prof::PREFIX);
+    g_prof.start(c->ctx);
+    for (int s = 0; s < ns; ++s) {
+        if (jobs[s].state) {
+            set_state(c, s, jobs[s].state);
+        }
+    }
+    g_prof.stop(c->ctx, sp_prof::STATE);
 
     // logits at s0 .. n_dec-1 predict the response tokens; the last token is only a target
     std::vector<std::vector<llama_token>> toks(ns);
@@ -195,13 +276,20 @@ static void score_round(sp_ctx * c, const std::vector<sp_seq_job> & jobs, int n_
                 items.push_back({ s, toks[s][i], pos + i, out });
             }
         }
+        g_prof.start(c->ctx);
         decode_items(c, items);
+        g_prof.stop(c->ctx, sp_prof::DECODE);
+        g_prof.n_dec++;
+        g_prof.n_tok += (int64_t) items.size();
+        g_prof.n_out += (int64_t) rows.size();
 
         // llama_get_logits_ith can reorder the outputs on first access, so it must not run concurrently
         std::vector<const float *> logits(rows.size());
         for (size_t r = 0; r < rows.size(); ++r) {
             logits[r] = llama_get_logits_ith(c->ctx, rows[r].idx);
         }
+        g_prof.stop(c->ctx, sp_prof::LOGITS);
+        g_prof.start(c->ctx);
 
         std::atomic<size_t> next(0);
         auto worker = [&]() {
@@ -225,6 +313,7 @@ static void score_round(sp_ctx * c, const std::vector<sp_seq_job> & jobs, int n_
         for (auto & x : th) {
             x.join();
         }
+        g_prof.stop(c->ctx, sp_prof::SOFTMAX);
         i0 += n;
     }
 }
@@ -269,10 +358,20 @@ SP_API sp_ctx * sp_init(const char * model_path, int32_t n_gpu_layers, int32_t n
         cparams.kv_unified      = true;
         cparams.n_threads       = c->n_threads;
         cparams.n_threads_batch = c->n_threads;
+        if (const char * e = getenv("SP_PROFILE"); e && atoi(e) >= 2) {
+            cparams.cb_eval = op_prof_cb;
+        }
         c->ctx = llama_init_from_model(c->model, cparams);
         if (!c->ctx) {
             llama_model_free(c->model);
             throw std::runtime_error("failed to create the context");
+        }
+        for (int32_t il = 0; il < llama_model_n_layer(c->model); ++il) {
+            const int64_t n = llama_model_layer_is_recr(c->model, il) ? llama_memory_seq_state_get(c->ctx, 0, il, nullptr) : 0;
+            if (n > 0) {
+                c->state_layers.emplace_back(il, n);
+                c->n_state += n;
+            }
         }
         return c;
     } catch (const std::exception & e) {
@@ -292,6 +391,24 @@ SP_API void sp_free(sp_ctx * c) {
 SP_API int32_t sp_n_embd (const sp_ctx * c) { return c->n_embd;  }
 SP_API int32_t sp_n_vocab(const sp_ctx * c) { return c->n_vocab; }
 SP_API int32_t sp_n_seq  (const sp_ctx * c) { return c->n_seq;   }
+SP_API int64_t sp_n_state(const sp_ctx * c) { return c->n_state; }
+
+// the recurrent state after the prefix (before + soft prompt theta): out [n_state]
+SP_API int32_t sp_get_state(sp_ctx * c, const float * theta, int32_t n_soft, float * out) {
+    try {
+        prefix(c, { theta }, n_soft);
+        for (auto [il, n] : c->state_layers) {
+            if (llama_memory_seq_state_get(c->ctx, 0, il, out) != n) {
+                throw std::runtime_error("failed to get the state of layer " + std::to_string(il));
+            }
+            out += n;
+        }
+        return 0;
+    } catch (const std::exception & e) {
+        g_error = e.what();
+        return -1;
+    }
+}
 
 SP_API int32_t sp_is_eog(const sp_ctx * c, int32_t tok) {
     return llama_vocab_is_eog(c->vocab, tok);
@@ -364,7 +481,8 @@ SP_API int32_t sp_token_embeddings(const sp_ctx * c, const int32_t * ids, int32_
 // teacher-forced log-probs at temperature temp; job j uses soft prompt thetas[theta_idx[j]] ([n_soft][n_embd] each),
 // prompt tokens post[post_off[j] .. + post_len[j]] and response tokens resp[resp_off[j] .. + resp_len[j]];
 // writes resp_len[j] log-probs to out[resp_off[j] ..]. Jobs run n_seq at a time.
-SP_API int32_t sp_score(sp_ctx * c, const float * thetas, int32_t n_soft, const int32_t * theta_idx, int32_t n_jobs,
+// states: nullptr, or one recurrent state per soft prompt ([n_state] each) that replaces the one after the prefix.
+SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, int32_t n_soft, const int32_t * theta_idx, int32_t n_jobs,
                         const int32_t * post, const int64_t * post_off, const int32_t * post_len,
                         const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
                         float temp, float * out) {
@@ -376,10 +494,21 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, int32_t n_soft, const 
                 if (post_len[j] < 1 || resp_len[j] < 1) {
                     throw std::runtime_error("every job needs at least one prompt and one response token");
                 }
-                jobs.push_back({ thetas + (size_t) theta_idx[j]*n_theta, post + post_off[j], post_len[j],
+                jobs.push_back({ thetas + (size_t) theta_idx[j]*n_theta, states ? states + (size_t) theta_idx[j]*c->n_state : nullptr,
+                                 post + post_off[j], post_len[j],
                                  resp + resp_off[j], resp_len[j], out + resp_off[j] });
             }
             score_round(c, jobs, n_soft, temp);
+        }
+        if (g_prof.on) {
+            const auto & t = g_prof.t;
+            fprintf(stderr, "sp_score: prefix %.2f s, state %.2f s, decode %.2f s, logits %.2f s, softmax %.2f s;"
+                    " %lld decodes, %lld tokens, %lld outputs\n", t[0]*1e-6, t[1]*1e-6, t[2]*1e-6, t[3]*1e-6, t[4]*1e-6,
+                    (long long) g_prof.n_dec, (long long) g_prof.n_tok, (long long) g_prof.n_out);
+            g_prof = sp_prof();
+            if (!g_op_prof.t.empty()) {
+                op_prof_print();
+            }
         }
         return 0;
     } catch (const std::exception & e) {
@@ -388,9 +517,9 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, int32_t n_soft, const 
     }
 }
 
-// samples a response for every prompt with the soft prompt theta, n_seq sequences at a time;
+// samples a response for every prompt with the soft prompt theta (and the recurrent state, if not nullptr), n_seq sequences at a time;
 // out_tok [n_prompts][max_new], out_len: tokens generated (the end-of-generation token included), out_finished: 1 if it ended
-SP_API int32_t sp_generate(sp_ctx * c, const float * theta, int32_t n_soft, int32_t n_prompts,
+SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state, int32_t n_soft, int32_t n_prompts,
                            const int32_t * post, const int64_t * post_off, const int32_t * post_len,
                            int32_t max_new, float temp, float top_p, int32_t top_k, uint64_t seed,
                            int32_t * out_tok, int32_t * out_len, int32_t * out_finished) {
@@ -398,6 +527,9 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, int32_t n_soft, int3
         for (int w0 = 0; w0 < n_prompts; w0 += c->n_seq) {
             const int ns = std::min(c->n_seq, n_prompts - w0);
             const llama_pos pos0 = prefix(c, std::vector<const float *>(ns, theta), n_soft);
+            for (int s = 0; state && s < ns; ++s) {
+                set_state(c, s, state);
+            }
 
             std::vector<llama_sampler *> smpl(ns);
             for (int s = 0; s < ns; ++s) {

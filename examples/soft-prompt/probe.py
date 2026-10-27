@@ -17,7 +17,7 @@ import time
 
 import rewards
 import rollout
-from softprompt import add_common_args, read_jsonl, setup, write_jsonl
+from softprompt import add_common_args, load_state, read_jsonl, setup, write_jsonl
 
 
 def main():
@@ -30,6 +30,9 @@ def main():
     args = ap.parse_args()
 
     eng, theta, tpl = setup(args)
+    state = load_state(args.init_file)
+    if state is not None:
+        print(f"with the recurrent state of {args.init_file}", file=sys.stderr)
     cfg = rewards.config_from_args(args)
     rows = read_jsonl(args.prompts)
     if args.n_prompts > 0:
@@ -38,7 +41,7 @@ def main():
 
     t0 = time.time()
     ids = [i for i in range(len(prompts)) for _ in range(args.group)]
-    samples = rollout.rollout(eng, theta, prompts, ids, args.gen_max, cfg, rollout.sampling_from_args(args), args.seed, args.reward_cmd)
+    samples = rollout.rollout(eng, theta, prompts, ids, args.gen_max, cfg, rollout.sampling_from_args(args), args.seed, args.reward_cmd, state)
     if args.samples_out:
         write_jsonl(args.samples_out, (rollout.sample_row(s, prompts) for s in samples))
 

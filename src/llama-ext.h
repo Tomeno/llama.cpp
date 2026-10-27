@@ -141,6 +141,15 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Recurrent state of one sequence (the "s" rows of the recurrent memory, e.g. delta-net matrices), F32 only.
+// The sequence must own its cell alone (no seq_cp sharing). Returns the size of layer il in floats (0: no state on
+// that layer, dst == src == nullptr: query only), -1 on error.
+LLAMA_API int64_t llama_memory_seq_state_get(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
+LLAMA_API int64_t llama_memory_seq_state_set(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * src);
+
+// true for the layers of the model that keep a recurrent state (hybrid models: not the attention layers)
+LLAMA_API bool llama_model_layer_is_recr(const struct llama_model * model, int32_t il);
+
 //
 // model/context data extraction
 //
