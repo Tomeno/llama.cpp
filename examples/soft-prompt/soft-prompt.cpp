@@ -18,7 +18,6 @@
 #include "gguf.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
@@ -49,7 +48,6 @@ struct sp_ctx {
     int32_t n_seq       = 1;  // sequences of the context
     int32_t n_batch     = 0;
     int32_t n_threads   = 1;
-    int32_t max_outputs = 512;
 
     std::vector<llama_token> before;
 
@@ -61,7 +59,7 @@ static std::string g_error;
 
 // phase timing (SP_PROFILE=1): synchronizes after every phase and prints a summary after every sp_score call
 struct sp_prof {
-    enum { PREFIX, STATE, DECODE, LOGITS, SOFTMAX, N };
+    enum { PREFIX, STATE, DECODE, LOGPROBS, N };
     bool    on = getenv("SP_PROFILE") != nullptr;
     int64_t t[N] = {};
     int64_t n_dec = 0, n_tok = 0, n_out = 0;
@@ -277,30 +275,26 @@ static void score_round(sp_ctx * c, const std::vector<sp_seq_job> & jobs, int n_
         s0[s]    = jobs[s].n_post - 1;
         n_max = std::max(n_max, n_dec[s]);
     }
-    const int   n_big   = chunk(c, ns);
-    const int   n_small = std::max(1, std::min(n_big, c->max_outputs / ns));
-    const float inv_t   = 1.0f / temp;
+    // the log-probs are computed on the device, one float per output, so every chunk is a full batch
+    const int n = chunk(c, ns);
+    llama_set_logprobs(c->ctx, temp);
 
-    for (int i0 = 0; i0 < n_max; ) {
-        // small chunks once any sequence produces outputs in the window, so that the logits fit
-        int n = n_big;
-        for (int s = 0; s < ns; ++s) {
-            if (i0 < n_dec[s] && i0 + n_big > s0[s]) {
-                n = n_small;
-            }
-        }
-        struct row { int seq; int idx; llama_token target; float * dst; }; // idx: position in the batch
-        std::vector<sp_item> items;
-        std::vector<row>     rows;
+    for (int i0 = 0; i0 < n_max; i0 += n) {
+        struct row { int idx; float * dst; }; // idx: position in the batch
+        std::vector<sp_item>     items;
+        std::vector<llama_token> targets;
+        std::vector<row>         rows;
         for (int s = 0; s < ns; ++s) {
             for (int i = i0; i < std::min(i0 + n, n_dec[s]); ++i) {
                 const bool out = i >= s0[s];
                 if (out) {
-                    rows.push_back({ s, (int) items.size(), toks[s][i + 1], jobs[s].logp + n_done[s]++ });
+                    rows.push_back({ (int) items.size(), jobs[s].logp + n_done[s]++ });
                 }
                 items.push_back({ s, toks[s][i], pos + i, out });
+                targets.push_back(out ? toks[s][i + 1] : 0);
             }
         }
+        llama_set_logprob_targets(c->ctx, targets.data(), (int32_t) targets.size());
         g_prof.start(c->ctx);
         decode_items(c, items);
         g_prof.stop(c->ctx, sp_prof::DECODE);
@@ -308,38 +302,10 @@ static void score_round(sp_ctx * c, const std::vector<sp_seq_job> & jobs, int n_
         g_prof.n_tok += (int64_t) items.size();
         g_prof.n_out += (int64_t) rows.size();
 
-        // llama_get_logits_ith can reorder the outputs on first access, so it must not run concurrently
-        std::vector<const float *> logits(rows.size());
-        for (size_t r = 0; r < rows.size(); ++r) {
-            logits[r] = llama_get_logits_ith(c->ctx, rows[r].idx);
+        for (const auto & r : rows) {
+            *r.dst = llama_get_logprob_ith(c->ctx, r.idx);
         }
-        g_prof.stop(c->ctx, sp_prof::LOGITS);
-        g_prof.start(c->ctx);
-
-        std::atomic<size_t> next(0);
-        auto worker = [&]() {
-            for (size_t r; (r = next++) < rows.size(); ) {
-                const float * l = logits[r];
-                float mx = l[0];
-                for (int v = 1; v < c->n_vocab; ++v) {
-                    mx = std::max(mx, l[v]);
-                }
-                double sum = 0.0;
-                for (int v = 0; v < c->n_vocab; ++v) {
-                    sum += std::exp((double) ((l[v] - mx) * inv_t));
-                }
-                *rows[r].dst = (float) ((double) ((l[rows[r].target] - mx) * inv_t) - std::log(sum));
-            }
-        };
-        std::vector<std::thread> th;
-        for (int k = 0; k < std::min<int>(c->n_threads, (int) rows.size()); ++k) {
-            th.emplace_back(worker);
-        }
-        for (auto & x : th) {
-            x.join();
-        }
-        g_prof.stop(c->ctx, sp_prof::SOFTMAX);
-        i0 += n;
+        g_prof.stop(c->ctx, sp_prof::LOGPROBS);
     }
 }
 
@@ -352,7 +318,7 @@ SP_API const char * sp_last_error(void) {
 }
 
 SP_API sp_ctx * sp_init(const char * model_path, int32_t n_gpu_layers, int32_t n_ctx, int32_t n_batch,
-                        int32_t n_seq, int32_t n_threads, int32_t max_outputs) {
+                        int32_t n_seq, int32_t n_threads) {
     try {
         llama_backend_init();
         auto * c = new sp_ctx();
@@ -360,7 +326,6 @@ SP_API sp_ctx * sp_init(const char * model_path, int32_t n_gpu_layers, int32_t n
         c->n_seq       = std::max(1, n_seq);
         c->n_batch     = std::max(n_batch, c->n_seq); // every decode call carries at least one token per sequence
         c->n_threads   = n_threads > 0 ? n_threads : (int32_t) std::max(1u, std::thread::hardware_concurrency());
-        c->max_outputs = max_outputs;
 
         auto mparams = llama_model_default_params();
         mparams.n_gpu_layers = n_gpu_layers;
@@ -512,6 +477,9 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, 
                         const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
                         float temp, float * out) {
     try {
+        if (!(temp > 0.0f)) {
+            throw std::runtime_error("sp_score needs temp > 0");
+        }
         const size_t n_theta = (size_t) n_soft * c->n_embd;
         for (int j0 = 0; j0 < n_jobs; j0 += c->n_seq) {
             std::vector<sp_seq_job> jobs;
@@ -525,10 +493,11 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, 
             }
             score_round(c, jobs, n_soft, temp);
         }
+        llama_set_logprobs(c->ctx, 0.0f);
         if (g_prof.on) {
             const auto & t = g_prof.t;
-            fprintf(stderr, "sp_score: prefix %.2f s, state %.2f s, decode %.2f s, logits %.2f s, softmax %.2f s;"
-                    " %lld decodes, %lld tokens, %lld outputs\n", t[0]*1e-6, t[1]*1e-6, t[2]*1e-6, t[3]*1e-6, t[4]*1e-6,
+            fprintf(stderr, "sp_score: prefix %.2f s, state %.2f s, decode %.2f s, log-probs %.2f s;"
+                    " %lld decodes, %lld tokens, %lld outputs\n", t[0]*1e-6, t[1]*1e-6, t[2]*1e-6, t[3]*1e-6,
                     (long long) g_prof.n_dec, (long long) g_prof.n_tok, (long long) g_prof.n_out);
             g_prof = sp_prof();
             if (!g_op_prof.t.empty()) {
@@ -549,6 +518,7 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                            int32_t max_new, float temp, float top_p, int32_t top_k, uint64_t seed,
                            int32_t * out_tok, int32_t * out_len, int32_t * out_finished) {
     try {
+        llama_set_logprobs(c->ctx, 0.0f); // sampling needs the logits
         for (int w0 = 0; w0 < n_prompts; w0 += c->n_seq) {
             const int ns = std::min(c->n_seq, n_prompts - w0);
             const llama_pos pos0 = prefix(c, std::vector<const float *>(ns, theta), n_soft);

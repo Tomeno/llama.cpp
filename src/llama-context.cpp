@@ -1084,6 +1084,24 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+void llama_context::set_logprobs(float temp) {
+    cparams.logprobs_temp = std::max(0.0f, temp);
+}
+
+void llama_context::set_logprob_targets(const llama_token * targets, int32_t n) {
+    lp_targets_batch.assign(targets, targets + n);
+}
+
+float llama_context::get_logprob_ith(int32_t i) {
+    output_reorder();
+
+    if (lp_out.empty()) {
+        throw std::runtime_error("log-prob mode is off");
+    }
+    synchronize();
+    return lp_out[output_resolve_row(i)];
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -2016,6 +2034,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        if (cparams.logprobs_temp > 0.0f) {
+            const auto & out_ids = balloc->get_out_ids();
+            GGML_ASSERT((int64_t) out_ids.size() >= n_outputs_prev + n_outputs);
+            lp_targets_ub.resize(n_outputs);
+            for (int32_t r = 0; r < n_outputs; ++r) {
+                const int32_t b = out_ids[n_outputs_prev + r];
+                GGML_ASSERT(b >= 0 && b < (int32_t) lp_targets_batch.size() && "llama_set_logprob_targets: missing targets");
+                lp_targets_ub[r] = lp_targets_batch[b];
+            }
+        }
+
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
@@ -2056,8 +2085,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
-        auto * t_logits  = res->get_logits();
+        auto * t_logprobs = res->get_logprobs();
+        auto * t_logits  = t_logprobs ? nullptr : res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+
+        if (t_logprobs && n_outputs > 0) {
+            ggml_backend_t backend_lp = ggml_backend_sched_get_tensor_backend(sched.get(), t_logprobs);
+            GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) lp_out.size());
+            ggml_backend_tensor_get_async(backend_lp, t_logprobs, lp_out.data() + n_outputs_prev, 0, n_outputs*sizeof(float));
+        }
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
@@ -2254,8 +2290,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = !cparams.embeddings || graph_has_logits;
+    bool has_logits     = (!cparams.embeddings || graph_has_logits) && cparams.logprobs_temp <= 0.0f;
     bool has_embd       = cparams.embeddings;
+
+    lp_out.resize(cparams.logprobs_temp > 0.0f ? n_outputs_max : 0);
     bool has_embd_nextn = cparams.embeddings_nextn;
 
     // TODO: hacky enc-dec support
@@ -2451,6 +2489,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
+        }
+
+        if (!lp_out.empty()) {
+            std::swap(lp_out[i0], lp_out[i1]);
         }
 
         if (embd.size > 0) {
@@ -2726,6 +2768,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.lp_targets  =*/ &lp_targets_ub,
     };
 }
 
@@ -4400,6 +4443,23 @@ int64_t llama_memory_seq_state_set(llama_context * ctx, llama_seq_id seq_id, int
     }
     ctx->synchronize();
     return mem->seq_state_s(seq_id, il, nullptr, src);
+}
+
+void llama_set_logprobs(llama_context * ctx, float temp) {
+    ctx->set_logprobs(temp);
+}
+
+void llama_set_logprob_targets(llama_context * ctx, const llama_token * targets, int32_t n_tokens) {
+    ctx->set_logprob_targets(targets, n_tokens);
+}
+
+float llama_get_logprob_ith(llama_context * ctx, int32_t i) {
+    try {
+        return ctx->get_logprob_ith(i);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid log-prob id %d, reason: %s\n", __func__, i, err.what());
+        return NAN;
+    }
 }
 
 bool llama_memory_seq_unshare(llama_context * ctx, llama_seq_id seq_id) {

@@ -45,7 +45,7 @@ def _find_lib() -> str:
 def _load_lib(path: str) -> ctypes.CDLL:
     lib = ctypes.CDLL(path)
     lib.sp_last_error.restype = ctypes.c_char_p
-    lib.sp_init.argtypes = [ctypes.c_char_p] + [ctypes.c_int32] * 6
+    lib.sp_init.argtypes = [ctypes.c_char_p] + [ctypes.c_int32] * 5
     lib.sp_init.restype = ctypes.c_void_p
     lib.sp_free.argtypes = [ctypes.c_void_p]
     for f in ("sp_n_embd", "sp_n_vocab", "sp_n_seq"):
@@ -99,9 +99,9 @@ class Engine:
     """One model and one context with n_seq parallel sequences (each holds a full sequence state)."""
 
     def __init__(self, model: str, n_gpu_layers: int = 999, n_ctx: int = 32768, n_batch: int = 2048, n_seq: int = 32,
-                 n_threads: int = 0, max_outputs: int = 512, lib: str | None = None):
+                 n_threads: int = 0, lib: str | None = None):
         self.lib = _load_lib(lib or _find_lib())
-        self.ctx = self.lib.sp_init(model.encode(), n_gpu_layers, n_ctx, n_batch, n_seq, n_threads, max_outputs)
+        self.ctx = self.lib.sp_init(model.encode(), n_gpu_layers, n_ctx, n_batch, n_seq, n_threads)
         if not self.ctx:
             raise RuntimeError(self.lib.sp_last_error().decode())
         self.n_embd  = self.lib.sp_n_embd(self.ctx)
@@ -290,7 +290,6 @@ def add_common_args(ap: argparse.ArgumentParser):
     g.add_argument("-b", "--batch", type=int, default=2048)
     g.add_argument("--par", type=int, default=32, help="parallel sequences; each holds a full sequence state")
     g.add_argument("-t", "--threads", type=int, default=0)
-    g.add_argument("--max-outputs", type=int, default=512, help="logits rows per decode call (rows x n_vocab x 4 bytes)")
     g = ap.add_argument_group("soft prompt")
     g.add_argument("--init-text", default="You are a helpful assistant.", help="start from the token embeddings of this text")
     g.add_argument("--init-file", help="start from a saved soft prompt (overrides --init-text and the template)")
@@ -303,7 +302,7 @@ def add_common_args(ap: argparse.ArgumentParser):
 
 def setup(args, n_seq: int | None = None) -> tuple[Engine, np.ndarray, Template]:
     """Engine, initial soft prompt [K, n_embd] and template from the common arguments."""
-    eng = Engine(args.model, args.n_gpu_layers, args.ctx, args.batch, n_seq or args.par, args.threads, args.max_outputs)
+    eng = Engine(args.model, args.n_gpu_layers, args.ctx, args.batch, n_seq or args.par, args.threads)
     if args.init_file:
         theta, tpl, _ = load_soft_prompt(args.init_file)
         print(f"loaded {theta.shape[0]} soft tokens from {args.init_file}", file=sys.stderr)

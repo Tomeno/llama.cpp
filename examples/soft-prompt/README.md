@@ -57,8 +57,8 @@ The scripts find `build/bin/libllama-soft-prompt.so` themselves (or set `SOFTPRO
 
 Memory: every parallel sequence (`--par`, and at least `2 x --pairs` for the ES population) holds a full EdgeRock
 sequence state, about 130 MiB of recurrent + RMA state plus up to ~48 MiB of window KV. On a 16 GB GPU with the Q4_K_M
-model (2.9 GB) `--par 32` (~5-6 GB) leaves room for compute buffers; start there. `--max-outputs` rows of logits are
-copied to the host per decode call (512 x 248k x 4 B = 0.5 GB).
+model (2.9 GB) `--par 32` (~5-6 GB) leaves room for compute buffers; start there. Scoring computes the log-probs of
+the targets on the device (`llama_set_logprobs`), so no logits are copied to the host.
 
 ## Data formats (JSONL)
 
@@ -72,7 +72,7 @@ copied to the host per decode call (512 x 248k x 4 B = 0.5 GB).
 ## Scripts
 
 Common options (all scripts): `-m`, `-ngl` (default all layers), `-c` context size, `-b` batch, `--par` parallel
-sequences, `-t` threads, `--max-outputs`, `--init-text` / `--init-file` / `--n-soft`, `--before` / `--after` /
+sequences, `-t` threads, `--init-text` / `--init-file` / `--n-soft`, `--before` / `--after` /
 `--example`, `--seed`. ES options (`train_nll.py`, `grpo.py`): `--pairs` (population 2N), `--sigma` and `--lr`
 (relative to the RMS of the init embeddings), `--rank` (low-rank noise, 0 = full), `--shaping none|rank`, `--steps`,
 `--eval-every`, `-o` (best by validation; `<out>.last` is the latest).
@@ -195,19 +195,19 @@ harder task (or a weaker start) to see improvements over a normal prompt.
 
 ## Performance notes and possible improvements
 
-- `SP_PROFILE=1` prints the wall time of the scoring phases (prefix, state, decode, logits, softmax) after every
+- `SP_PROFILE=1` prints the wall time of the scoring phases (prefix, state, decode, log-probs) after every
   `sp_score` call; `SP_PROFILE=2` also times every graph node by op (it synchronizes after each node, so the totals
   are inflated, but the ranking holds). `runs/meta-talk/prof/bench_score.py` is a fixed workload (one ES step) that
   checks the losses against a saved run.
 - EdgeRock 4B Q4_K_M, A4000, one state-tuning step (24 members x 8 examples, `--par 24`): 19.6 s before the RMA
   commit / read counts were made exact (every ubatch ran a full commit and two reads over 24 x 8 MB of records per
   layer, also with nothing to commit), 11.0 s after (bit-identical results), 9.8 s with the shared prefix (rounding
-  level changes: the prefix KV cells are shared).
+  level changes: the prefix KV cells are shared), 7.9 s with the log-probs on the device (full 85-token chunks per
+  sequence instead of 21, so that the logits fit on the host; same chunks: within 1.3e-7 of the host log-softmax).
 - Every distinct soft prompt of a round is evaluated once and copied to the other sequences (`seq_cp` plus
   `llama_memory_seq_unshare`, so that their states can be replaced); state tuning evaluates a single prefix per round.
   Prompts are still re-run per job; processing the prompt once per sample group would be the next step.
-- The log-softmax over the 248k vocabulary runs on the host for every scored token (`--max-outputs` rows per call).
-  A GPU-side log-prob of the target token would remove the 0.5 GB logits copy per call.
+- Device log-probs are a softmax plus a gather, clamped at about -87.3 (probabilities below FLT_MIN).
 - Noise is generated on the host (numpy) and the members are copied in every call; fine for K x n_embd = 82k values.
 
 ## Plan and design notes

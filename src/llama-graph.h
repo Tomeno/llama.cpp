@@ -834,6 +834,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    const std::vector<llama_token> * lp_targets = nullptr; // target token per output row of the ubatch (logprobs_temp > 0)
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -897,6 +899,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.logprobs_temp != other.cparams.logprobs_temp) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -924,6 +930,7 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    ggml_tensor * get_logprobs()    const { return t_logprobs; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
@@ -963,6 +970,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_logprobs    = nullptr; // [n_outputs] log-probs of the targets (logprobs_temp > 0)
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1070,6 +1078,8 @@ struct llm_graph_context {
     const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const std::vector<llama_token> * lp_targets;
 
     const llm_graph_cb & cb_func;
 
@@ -1468,6 +1478,9 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    // replaces the logits by the log-probs of the target tokens (cparams.logprobs_temp > 0)
+    void build_logprobs() const;
 
     //
     // dense (out)

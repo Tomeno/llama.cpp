@@ -12,7 +12,7 @@ typedef struct sp_ctx sp_ctx;
 const char * sp_last_error(void);
 
 sp_ctx * sp_init(const char * model_path, int32_t n_gpu_layers, int32_t n_ctx, int32_t n_batch,
-                 int32_t n_seq, int32_t n_threads, int32_t max_outputs);
+                 int32_t n_seq, int32_t n_threads);
 void     sp_free(sp_ctx * c);
 
 int32_t sp_n_embd (const sp_ctx * c);

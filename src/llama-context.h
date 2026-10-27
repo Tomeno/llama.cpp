@@ -84,6 +84,11 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // log-prob mode (cparams.logprobs_temp > 0): targets by batch index for the next decode, log-prob of output i
+    void  set_logprobs(float temp);
+    void  set_logprob_targets(const llama_token * targets, int32_t n);
+    float get_logprob_ith(int32_t i);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -356,6 +361,10 @@ private:
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+
+    std::vector<llama_token> lp_targets_batch; // log-prob mode: target per batch token
+    std::vector<llama_token> lp_targets_ub;    // ... per output row of the current ubatch
+    std::vector<float>       lp_out;           // ... log-prob per output row
 
     struct swap_info {
         uint32_t i0;

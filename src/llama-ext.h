@@ -147,6 +147,13 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API int64_t llama_memory_seq_state_get(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
 LLAMA_API int64_t llama_memory_seq_state_set(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * src);
 
+// log-prob mode, temp > 0 (0: off, the default): every output row of a decode is the log-prob of a given target token
+// (log-softmax at temperature temp, computed on the device, clamped at about -87.3) instead of the logits, which are not
+// copied out. Before every decode, targets[i] is the target of batch token i (only the outputs are read).
+LLAMA_API void  llama_set_logprobs       (struct llama_context * ctx, float temp);
+LLAMA_API void  llama_set_logprob_targets(struct llama_context * ctx, const llama_token * targets, int32_t n_tokens);
+LLAMA_API float llama_get_logprob_ith    (struct llama_context * ctx, int32_t i);
+
 // gives seq_id its own recurrent cell now (device copy) when it shares one, e.g. right after llama_memory_seq_cp,
 // so that llama_memory_seq_state_set works before the next decode; false on error
 LLAMA_API bool llama_memory_seq_unshare(struct llama_context * ctx, llama_seq_id seq_id);
