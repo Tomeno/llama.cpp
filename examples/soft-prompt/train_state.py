@@ -5,7 +5,7 @@
 The soft prompt (or text) prefix stays fixed and is processed as usual; its recurrent state is then replaced by
     state = s0 + scale * z
 where s0 is the state the prefix leaves, scale the RMS of each head's matrix in s0 and z the tuned parameters
-(init 0, so --sigma / --lr are relative to each head's own scale). The noise is low rank per matrix (--rank).
+(init 0, or the state of the --init-file, so --sigma / --lr are relative to each head's own scale). The noise is low rank per matrix (--rank).
 The window KV, the conv states and the RMA records stay as the prefix leaves them.
 
 Data and validation as train_nll.py. The result is a soft prompt file that also holds the state (probe.py and
@@ -23,7 +23,7 @@ import numpy as np
 import es as es_mod
 import rewards
 import rollout
-from softprompt import add_common_args, read_jsonl, save_state, setup
+from softprompt import add_common_args, load_state, read_jsonl, save_state, setup
 from train_nll import load, nll
 
 HEAD = 128  # head_v_dim: the state of a head is HEAD x HEAD
@@ -83,7 +83,13 @@ def main():
     def save(path: str, z, meta: dict):
         save_state(path, theta, states(z[None])[0], tpl, meta)
 
-    es = es_mod.ES(np.zeros_like(s0), args.sigma, args.lr, args.pairs, args.rank, args.shaping, args.seed + 1)
+    # an --init-file that holds a state (a previous run) continues from it
+    z0 = np.zeros_like(s0)
+    st0 = load_state(args.init_file)
+    if st0 is not None:
+        z0 = (st0.reshape(s0.shape) - s0) / scale[:, None, None]
+        print(f"continuing from the state in {args.init_file}, drift {np.sqrt(np.mean(z0 ** 2)):.3f} head RMS", file=sys.stderr)
+    es = es_mod.ES(z0, args.sigma, args.lr, args.pairs, args.rank, args.shaping, args.seed + 1)
     rng = np.random.default_rng(args.seed)
     order, cursor = rng.permutation(len(train)), 0
 
