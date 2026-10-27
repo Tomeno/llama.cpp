@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid-iswa.h"
 
 #include <cmath>
 
@@ -16,13 +17,65 @@
 // large negative logit/score for the records that are not valid, finite to keep 0*x and x-x well defined
 static constexpr float RMA_INVALID = 1e30f;
 
+// commits and committed states read by a ubatch, from the positions: a sequence commits at every multiple of the chunk
+// it reaches, and its committed state is empty before the first commit (position < chunk)
+struct rma_counts {
+    int64_t n_commit = 0; // max commits in the ubatch
+    int64_t read0    = 0; // the tokens read the committed states read0 .. n_read-1 (state 0: the one before the ubatch)
+    int64_t n_read   = 0;
+
+    bool operator==(const rma_counts & o) const {
+        return n_commit == o.n_commit && read0 == o.read0 && n_read == o.n_read;
+    }
+};
+
+static rma_counts rma_get_counts(const llama_ubatch & ubatch, int64_t P) {
+    const int64_t T = ubatch.n_seq_tokens;
+
+    bool all_zero = true;
+    for (uint32_t i = 0; i < ubatch.n_tokens && all_zero; ++i) {
+        all_zero = ubatch.pos[i] == 0;
+    }
+    if (all_zero) {
+        // the graph reserve (or first tokens): the worst case
+        return { (P - 1 + T)/P, 0, (P - 2 + T)/P + 1 };
+    }
+
+    rma_counts c;
+    c.read0 = 1;
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const int64_t p0 = ubatch.pos[s*T];
+        c.n_commit = std::max(c.n_commit, (p0 + T)/P - p0/P);
+        c.n_read   = std::max(c.n_read,   (p0 + T - 1)/P - p0/P + 1);
+        if (p0 >= P) {
+            c.read0 = 0;
+        }
+    }
+    return c;
+}
+
+// true if the ubatch moves or clears recurrent states (then every state goes through the gather in build_rs)
+static bool rs_moves(const llama_memory_recurrent_context * mctx) {
+    if (mctx->get_rs_z() >= 0) {
+        return true;
+    }
+    for (uint32_t i = 0; i < mctx->get_n_rs(); ++i) {
+        if (mctx->s_copy(i) != (int32_t) (mctx->get_head() + i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // gather indices and masks of the commits that fall inside the ubatch, computed from the positions
 class llm_graph_input_mem_rma : public llm_graph_input_i {
 public:
-    llm_graph_input_mem_rma(int64_t n_chunk, int64_t n_head_kv, int64_t n_seq_tokens, int64_t n_seqs) :
-        n_chunk(n_chunk), n_head_kv(n_head_kv), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-        n_commit((n_chunk - 1 + n_seq_tokens) / n_chunk),
-        n_read  ((n_chunk - 2 + n_seq_tokens) / n_chunk + 1) {}
+    llm_graph_input_mem_rma(int64_t n_chunk, int64_t n_head_kv, const llama_ubatch & ubatch, const llama_memory_recurrent_context * mctx) :
+        n_chunk(n_chunk), n_head_kv(n_head_kv), n_seq_tokens(ubatch.n_seq_tokens), n_seqs(ubatch.n_seqs),
+        counts(rma_get_counts(ubatch, n_chunk)),
+        n_commit(counts.n_commit), read0(counts.read0), n_read(counts.n_read),
+        moves(rs_moves(mctx)),
+        use_comm(n_commit > 0 || read0 < n_read || moves) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_ASSERT(ubatch->n_seq_tokens == n_seq_tokens && ubatch->n_seqs == n_seqs);
@@ -70,8 +123,10 @@ public:
             }
         }
 
-        ggml_backend_tensor_set(commit_idx, commit.data(), 0, ggml_nbytes(commit_idx));
-        ggml_backend_tensor_set(commit_on,  on.data(),     0, ggml_nbytes(commit_on));
+        if (n_commit > 0) {
+            ggml_backend_tensor_set(commit_idx, commit.data(), 0, ggml_nbytes(commit_idx));
+            ggml_backend_tensor_set(commit_on,  on.data(),     0, ggml_nbytes(commit_on));
+        }
         ggml_backend_tensor_set(pend_idx,   pend.data(),   0, ggml_nbytes(pend_idx));
         if (read_sel) {
             ggml_backend_tensor_set(read_sel, sel.data(), 0, ggml_nbytes(read_sel));
@@ -79,15 +134,21 @@ public:
     }
 
     bool can_reuse(const llm_graph_params & params) override {
-        return params.ubatch.n_seq_tokens == n_seq_tokens && params.ubatch.n_seqs == n_seqs;
+        return params.ubatch.n_seq_tokens == n_seq_tokens && params.ubatch.n_seqs == n_seqs &&
+               rma_get_counts(params.ubatch, n_chunk) == counts &&
+               rs_moves(static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx)->get_recr()) == moves;
     }
 
-    const int64_t n_chunk;
-    const int64_t n_head_kv;
-    const int64_t n_seq_tokens;
-    const int64_t n_seqs;
-    const int64_t n_commit; // max commits in a ubatch
-    const int64_t n_read;   // max committed states read by the tokens of a ubatch
+    const int64_t    n_chunk;
+    const int64_t    n_head_kv;
+    const int64_t    n_seq_tokens;
+    const int64_t    n_seqs;
+    const rma_counts counts;
+    const int64_t    n_commit; // max commits in the ubatch
+    const int64_t    read0;    // the committed states read0 .. n_read-1 are read (the others are empty or unused)
+    const int64_t    n_read;
+    const bool       moves;    // the ubatch moves or clears recurrent states
+    const bool       use_comm; // the committed records are needed (else they stay in place, untouched)
 
     ggml_tensor * commit_idx = nullptr; // I32 [n_chunk, n_head_kv, n_seqs, n_commit]
     ggml_tensor * commit_on  = nullptr; // F32 [n_seqs, n_commit], 1 if the commit happens
@@ -184,16 +245,18 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
 
     llm_graph_input_mem_rma * inp_mem;
     {
-        auto inp_rma = std::make_unique<llm_graph_input_mem_rma>(hparams.n_mem_chunk, n_head_kv, ubatch.n_seq_tokens, ubatch.n_seqs);
+        auto inp_rma = std::make_unique<llm_graph_input_mem_rma>(hparams.n_mem_chunk, n_head_kv, ubatch, inp->get_recr()->mctx);
 
         const int64_t P = inp_rma->n_chunk;
         const int64_t S = inp_rma->n_seqs;
 
-        inp_rma->commit_idx = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, P, n_head_kv, S, inp_rma->n_commit);
-        inp_rma->commit_on  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, S, inp_rma->n_commit);
-        inp_rma->pend_idx   = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, P, n_head_kv, S);
-        ggml_set_input(inp_rma->commit_idx);
-        ggml_set_input(inp_rma->commit_on);
+        if (inp_rma->n_commit > 0) {
+            inp_rma->commit_idx = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, P, n_head_kv, S, inp_rma->n_commit);
+            inp_rma->commit_on  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, S, inp_rma->n_commit);
+            ggml_set_input(inp_rma->commit_idx);
+            ggml_set_input(inp_rma->commit_on);
+        }
+        inp_rma->pend_idx = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, P, n_head_kv, S);
         ggml_set_input(inp_rma->pend_idx);
 
         if (inp_rma->n_read > 1) {
@@ -222,7 +285,9 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
 
             ggml_tensor * mem_out = build_layer_mem(inp->get_recr(), inp_mem, inpSA, inp_pos, sections, il);
-            cur = ggml_add(ctx0, cur, mem_out);
+            if (mem_out) {
+                cur = ggml_add(ctx0, cur, mem_out);
+            }
             cb(cur, "attn_mem_out", il);
         }
 
@@ -341,16 +406,22 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
     ggml_tensor * s_all = mctx_cur->get_s_l(il);
 
     ggml_tensor * pend = build_rs(inp_rs, r_all, hparams.n_embd_r(il), S); // [n_embd_r, S]
-    ggml_tensor * comm = build_rs(inp_rs, s_all, hparams.n_embd_s(il), S); // [n_embd_s, S]
+    ggml_tensor * comm = inp_mem->use_comm ? build_rs(inp_rs, s_all, hparams.n_embd_s(il), S) : nullptr; // [n_embd_s, S]
 
     ggml_tensor * pend_k = ggml_view_4d(ctx0, pend, D, P, G, S, D*esz, D*P*esz, pend->nb[1], 0);
     ggml_tensor * pend_v = ggml_view_4d(ctx0, pend, D, P, G, S, D*esz, D*P*esz, pend->nb[1], D*P*G*esz);
     ggml_tensor * pend_s = ggml_view_3d(ctx0, pend,    P, G, S,    P*esz,       pend->nb[1], 2*D*P*G*esz);
 
-    ggml_tensor * comm_k = ggml_cont(ctx0, ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], 0));
-    ggml_tensor * comm_v = ggml_cont(ctx0, ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], D*C*G*esz));
-    ggml_tensor * comm_s = ggml_cont(ctx0, ggml_view_3d(ctx0, comm,    C, G, S,    C*esz,       comm->nb[1], 2*D*C*G*esz));
-    ggml_tensor * comm_f = ggml_cont(ctx0, ggml_view_3d(ctx0, comm,    C, G, S,    C*esz,       comm->nb[1], (2*D*C*G + C*G)*esz));
+    ggml_tensor * comm_k = nullptr;
+    ggml_tensor * comm_v = nullptr;
+    ggml_tensor * comm_s = nullptr;
+    ggml_tensor * comm_f = nullptr;
+    if (comm) {
+        comm_k = ggml_cont(ctx0, ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], 0));
+        comm_v = ggml_cont(ctx0, ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], D*C*G*esz));
+        comm_s = ggml_cont(ctx0, ggml_view_3d(ctx0, comm,    C, G, S,    C*esz,       comm->nb[1], 2*D*C*G*esz));
+        comm_f = ggml_cont(ctx0, ggml_view_3d(ctx0, comm,    C, G, S,    C*esz,       comm->nb[1], (2*D*C*G + C*G)*esz));
+    }
 
     // pending slots followed by the records of the ubatch, the commit and pending indices point into these
     ggml_tensor * ext_k = ggml_concat(ctx0, pend_k, k, 1);                                 // [D, P + T, G, S]
@@ -420,7 +491,7 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
 
     ggml_tensor * read = nullptr;
 
-    for (int64_t ir = 0; ir < inp_mem->n_read; ++ir) {
+    for (int64_t ir = inp_mem->read0; ir < inp_mem->n_read; ++ir) {
         const rma_state & st = states[ir];
 
         ggml_tensor * ks = ggml_pad(ctx0, st.k, 0, 1, 0, 0);                                   // [D, C + 1, G, S]
@@ -447,7 +518,9 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
 
         read = read ? ggml_add(ctx0, read, out) : out;
     }
-    cb(read, "mem_read", il);
+    if (read) {
+        cb(read, "mem_read", il);
+    }
 
     // store the records
     {
@@ -466,10 +539,19 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
         store(new_pv, r_all, D*P*G, D*P*G);
         store(new_ps, r_all,   P*G, 2*D*P*G);
 
-        store(st.k, s_all, D*C*G, 0);
-        store(st.v, s_all, D*C*G, D*C*G);
-        store(st.s, s_all,   C*G, 2*D*C*G);
-        store(st.f, s_all,   C*G, 2*D*C*G + C*G);
+        if (inp_mem->n_commit > 0) {
+            store(st.k, s_all, D*C*G, 0);
+            store(st.v, s_all, D*C*G, D*C*G);
+            store(st.s, s_all,   C*G, 2*D*C*G);
+            store(st.f, s_all,   C*G, 2*D*C*G + C*G);
+        } else if (comm) {
+            store(comm, s_all, hparams.n_embd_s(il), 0); // unchanged, but moved or cleared
+        }
+    }
+
+    if (!read) {
+        // no token can see a committed record: the read is exactly zero
+        return nullptr;
     }
 
     // gated output projection
