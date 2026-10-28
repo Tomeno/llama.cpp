@@ -82,7 +82,8 @@ qwen35moe does).
 - **Decode reads the states in place**: when a ubatch moves no recurrent state (`is_in_place`), `build_rs` returns
   views of the cache rows instead of gathering copies; the RMA read multiplies the committed K / V views directly
   (`out_prod` sums over the records, so V needs no transpose), and without a commit the new pending records are
-  written to their slots with `set_rows`. Copies of the whole state per token (~130 MiB per sequence) made batched
+  written to their slots with `set_rows`. In a single-token ubatch only the sequences that reach a commit point are
+  gathered, merged and written back (`set_rows`), instead of merging and blending the bank of every sequence. Copies of the whole state per token (~130 MiB per sequence) made batched
   generation scale linearly with the number of sequences; this cut the decode time of 24 parallel sequences by 2.3x.
 - Cost/limit: the graph has `ceil(n_seq_tokens / chunk) + 1` reads and commits per memory layer, so very small
   commit chunks with huge ubatches blow up the graph (tiny test models: keep `-ub <= 64`). For EdgeRock-4B (chunk 256)

@@ -68,7 +68,19 @@ public:
         n_commit(counts.n_commit), read0(counts.read0), n_read(counts.n_read),
         moves(rs_moves(mctx)),
         use_comm(n_commit > 0 || read0 < n_read || moves),
-        pend_in_place(n_commit == 0 && !moves) {}
+        n_commit_seqs(n_seq_tokens == 1 && n_commit > 0 && !moves ? count_commit_seqs(ubatch, n_chunk) : 0),
+        commit_sub(n_commit_seqs > 0),
+        pend_in_place((n_commit == 0 || commit_sub) && !moves),
+        head(mctx->get_head()) {}
+
+    // single-token ubatch: the sequences whose token completes a chunk (pos % chunk == chunk - 1)
+    static int64_t count_commit_seqs(const llama_ubatch & ubatch, int64_t P) {
+        int64_t n = 0;
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            n += ubatch.pos[s] % P == P - 1;
+        }
+        return n;
+    }
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_ASSERT(ubatch->n_seq_tokens == n_seq_tokens && ubatch->n_seqs == n_seqs);
@@ -116,9 +128,28 @@ public:
             }
         }
 
-        if (n_commit > 0) {
+        if (n_commit > 0 && !commit_sub) {
             ggml_backend_tensor_set(commit_idx, commit.data(), 0, ggml_nbytes(commit_idx));
             ggml_backend_tensor_set(commit_on,  on.data(),     0, ggml_nbytes(commit_on));
+        }
+        if (commit_sub) {
+            // the chunk of a committing sequence: pending slots 0 .. P-2, then the token of the ubatch (index P)
+            std::vector<int32_t> cells, seqs, idx;
+            for (int64_t s = 0; s < n_seqs; ++s) {
+                if (ubatch->pos[s] % P == P - 1) {
+                    cells.push_back((int32_t) (head + s));
+                    seqs.push_back((int32_t) s);
+                    for (int64_t g = 0; g < n_head_kv; ++g) {
+                        for (int64_t j = 0; j < P; ++j) {
+                            idx.push_back((int32_t) (j < P - 1 ? j : P));
+                        }
+                    }
+                }
+            }
+            GGML_ASSERT((int64_t) cells.size() == n_commit_seqs);
+            ggml_backend_tensor_set(commit_cells,   cells.data(), 0, ggml_nbytes(commit_cells));
+            ggml_backend_tensor_set(commit_seqs,    seqs.data(),  0, ggml_nbytes(commit_seqs));
+            ggml_backend_tensor_set(commit_sub_idx, idx.data(),   0, ggml_nbytes(commit_sub_idx));
         }
         if (pend_idx) {
             ggml_backend_tensor_set(pend_idx, pend.data(), 0, ggml_nbytes(pend_idx));
@@ -145,7 +176,8 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         return params.ubatch.n_seq_tokens == n_seq_tokens && params.ubatch.n_seqs == n_seqs &&
                rma_get_counts(params.ubatch, n_chunk) == counts &&
-               rs_moves(static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx)->get_recr()) == moves;
+               rs_moves(static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx)->get_recr()) == moves &&
+               (!commit_sub || count_commit_seqs(params.ubatch, n_chunk) == n_commit_seqs);
     }
 
     const int64_t    n_chunk;
@@ -158,7 +190,10 @@ public:
     const int64_t    n_read;
     const bool       moves;    // the ubatch moves or clears recurrent states
     const bool       use_comm; // the committed records are needed (else they stay in place, untouched)
-    const bool       pend_in_place; // no commit, no moves: the new pending records are written to their slots in the cache
+    const int64_t    n_commit_seqs; // single-token ubatch without moves: the sequences that commit
+    const bool       commit_sub;    // only these are merged (gathered, merged, written back), the others stay in place
+    const bool       pend_in_place; // no moves, no commit or commit_sub: the new pending records are written to their slots
+    const uint32_t   head;
 
     ggml_tensor * commit_idx = nullptr; // I32 [n_chunk, n_head_kv, n_seqs, n_commit]
     ggml_tensor * commit_on  = nullptr; // F32 [n_seqs, n_commit], 1 if the commit happens
@@ -166,6 +201,10 @@ public:
     ggml_tensor * pend_rows  = nullptr; // I64 [n_seq_tokens*n_head_kv, n_seqs], pending slot g*n_chunk + pos % n_chunk of each token
     ggml_tensor * read_sel   = nullptr; // F32 [n_seq_tokens, n_seqs, n_read], 1 if the token reads that state (n_read > 1)
     ggml_tensor * sink       = nullptr; // F32 [n_head_kv], zeros: the logit of the zero sink
+
+    ggml_tensor * commit_cells   = nullptr; // I32 [n_commit_seqs], cache rows of the committing sequences (commit_sub)
+    ggml_tensor * commit_seqs    = nullptr; // I32 [n_commit_seqs], their index in the ubatch
+    ggml_tensor * commit_sub_idx = nullptr; // I32 [n_chunk, n_head_kv, n_commit_seqs], their chunk in [pending, token]
 };
 
 void llama_model_edgerock::load_arch_hparams(llama_model_loader & ml) {
@@ -262,7 +301,15 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
         const int64_t P = inp_rma->n_chunk;
         const int64_t S = inp_rma->n_seqs;
 
-        if (inp_rma->n_commit > 0) {
+        if (inp_rma->commit_sub) {
+            const int64_t Sc = inp_rma->n_commit_seqs;
+            inp_rma->commit_cells   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, Sc);
+            inp_rma->commit_seqs    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, Sc);
+            inp_rma->commit_sub_idx = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, P, n_head_kv, Sc);
+            ggml_set_input(inp_rma->commit_cells);
+            ggml_set_input(inp_rma->commit_seqs);
+            ggml_set_input(inp_rma->commit_sub_idx);
+        } else if (inp_rma->n_commit > 0) {
             inp_rma->commit_idx = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, P, n_head_kv, S, inp_rma->n_commit);
             inp_rma->commit_on  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, S, inp_rma->n_commit);
             ggml_set_input(inp_rma->commit_idx);
@@ -463,9 +510,30 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
         ggml_tensor * f; // [C, G, S]
     };
 
+    // the merged records of a commit: the committed ones st and the P records of the chunk (idx into ext), keep the C best
+    // scores; Sx sequences
+    auto merge = [&](const rma_state & st, ggml_tensor * xk, ggml_tensor * xv, ggml_tensor * xs, ggml_tensor * idx, int64_t Sx) {
+        ggml_tensor * cand_k = ggml_concat(ctx0, st.k, ggml_get_rows(ctx0, xk, idx), 1);       // [D, C + P, G, Sx]
+        ggml_tensor * cand_v = ggml_concat(ctx0, st.v, ggml_get_rows(ctx0, xv, idx), 1);
+        ggml_tensor * cand_s = ggml_concat(ctx0, masked_score(st.s, st.f),
+                ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, xs, idx), P, G, Sx), 0);             // [C + P, G, Sx]
+
+        // argsort instead of top_k: the order of the kept records must not depend on the backend run (CUDA top_k is unordered)
+        ggml_tensor * top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, cand_s, C));              // [C, G, Sx]
+
+        ggml_tensor * new_s = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, cand_s, 1, C + P, G, Sx), top);
+        new_s = ggml_reshape_3d(ctx0, new_s, C, G, Sx);
+        return rma_state {
+            ggml_get_rows(ctx0, cand_k, top),
+            ggml_get_rows(ctx0, cand_v, top),
+            new_s,
+            ggml_step(ctx0, ggml_scale_bias(ctx0, new_s, 1.0f, 0.5f*RMA_INVALID)),
+        };
+    };
+
     std::vector<rma_state> states = { { comm_k, comm_v, comm_s, comm_f } };
 
-    for (int64_t ic = 0; ic < inp_mem->n_commit; ++ic) {
+    for (int64_t ic = 0; ic < (inp_mem->commit_sub ? 0 : inp_mem->n_commit); ++ic) {
         const rma_state & st = states.back();
 
         ggml_tensor * idx = ggml_view_3d(ctx0, inp_mem->commit_idx, P, G, S,
@@ -474,20 +542,7 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
                 esz, esz, ic*inp_mem->commit_on->nb[1]);
         ggml_tensor * off = ggml_scale_bias(ctx0, on, -1.0f, 1.0f);
 
-        // candidates: the committed records and the P records of the chunk, keep the C best scores
-        ggml_tensor * cand_k = ggml_concat(ctx0, st.k, ggml_get_rows(ctx0, ext_k, idx), 1);   // [D, C + P, G, S]
-        ggml_tensor * cand_v = ggml_concat(ctx0, st.v, ggml_get_rows(ctx0, ext_v, idx), 1);
-        ggml_tensor * cand_s = ggml_concat(ctx0, masked_score(st.s, st.f),
-                ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, ext_s, idx), P, G, S), 0);           // [C + P, G, S]
-
-        // argsort instead of top_k: the order of the kept records must not depend on the backend run (CUDA top_k is unordered)
-        ggml_tensor * top = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, cand_s, C));              // [C, G, S]
-
-        ggml_tensor * new_k = ggml_get_rows(ctx0, cand_k, top);
-        ggml_tensor * new_v = ggml_get_rows(ctx0, cand_v, top);
-        ggml_tensor * new_s = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, cand_s, 1, C + P, G, S), top);
-        new_s = ggml_reshape_3d(ctx0, new_s, C, G, S);
-        ggml_tensor * new_f = ggml_step(ctx0, ggml_scale_bias(ctx0, new_s, 1.0f, 0.5f*RMA_INVALID));
+        const rma_state nw = merge(st, ext_k, ext_v, ext_s, idx, S);
 
         // only the sequences that reach a commit point take the merged records
         auto blend = [&](ggml_tensor * a, ggml_tensor * b, ggml_tensor * m_on, ggml_tensor * m_off) {
@@ -498,10 +553,10 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
         ggml_tensor * off4 = ggml_reshape_4d(ctx0, off, 1, 1, 1, S);
 
         states.push_back({
-            blend(st.k, new_k, on4, off4),
-            blend(st.v, new_v, on4, off4),
-            blend(st.s, new_s, on,  off),
-            blend(st.f, new_f, on,  off),
+            blend(st.k, nw.k, on4, off4),
+            blend(st.v, nw.v, on4, off4),
+            blend(st.s, nw.s, on,  off),
+            blend(st.f, nw.f, on,  off),
         });
     }
 
@@ -571,7 +626,37 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
             store(new_ps, r_all,   P*G, 2*D*P*G);
         }
 
-        if (inp_mem->n_commit > 0) {
+        if (inp_mem->commit_sub) {
+            // gather the committing sequences, merge, write their rows back (the read above used the old records)
+            const int64_t Sc = inp_mem->n_commit_seqs;
+            ggml_tensor * cs = ggml_get_rows(ctx0, s_all, inp_mem->commit_cells);               // [n_embd_s, Sc]
+            ggml_tensor * ps = ggml_get_rows(ctx0, r_all, inp_mem->commit_cells);               // [n_embd_r, Sc]
+            const rma_state sc = {
+                ggml_view_4d(ctx0, cs, D, C, G, Sc, D*esz, D*C*esz, cs->nb[1], 0),
+                ggml_view_4d(ctx0, cs, D, C, G, Sc, D*esz, D*C*esz, cs->nb[1], D*C*G*esz),
+                ggml_cont(ctx0, ggml_view_3d(ctx0, cs, C, G, Sc, C*esz, cs->nb[1], 2*D*C*G*esz)),
+                ggml_cont(ctx0, ggml_view_3d(ctx0, cs, C, G, Sc, C*esz, cs->nb[1], (2*D*C*G + C*G)*esz)),
+            };
+            ggml_tensor * tk = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, k, D*G, S), inp_mem->commit_seqs), D, 1, G, Sc);
+            ggml_tensor * tv = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, v, D*G, S), inp_mem->commit_seqs), D, 1, G, Sc);
+            ggml_tensor * ts = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, score, G, S), inp_mem->commit_seqs), 1, G, Sc);
+
+            ggml_tensor * xk = ggml_concat(ctx0, ggml_view_4d(ctx0, ps, D, P, G, Sc, D*esz, D*P*esz, ps->nb[1], 0), tk, 1);
+            ggml_tensor * xv = ggml_concat(ctx0, ggml_view_4d(ctx0, ps, D, P, G, Sc, D*esz, D*P*esz, ps->nb[1], D*P*G*esz), tv, 1);
+            ggml_tensor * xs = ggml_concat(ctx0, ggml_view_3d(ctx0, ps, P, G, Sc, P*esz, ps->nb[1], 2*D*P*G*esz), ts, 0);
+            xs = ggml_reshape_4d(ctx0, xs, 1, P + 1, G, Sc);
+
+            const rma_state nw = merge(sc, xk, xv, xs, inp_mem->commit_sub_idx, Sc);
+
+            auto put = [&](ggml_tensor * src, int64_t n, int64_t offset) {
+                ggml_tensor * dst = ggml_view_2d(ctx0, s_all, n, s_all->ne[1], s_all->nb[1], offset*esz);
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n, Sc), inp_mem->commit_cells));
+            };
+            put(nw.k, D*C*G, 0);
+            put(nw.v, D*C*G, D*C*G);
+            put(nw.s,   C*G, 2*D*C*G);
+            put(nw.f,   C*G, 2*D*C*G + C*G);
+        } else if (inp_mem->n_commit > 0) {
             store(st.k, s_all, D*C*G, 0);
             store(st.v, s_all, D*C*G, D*C*G);
             store(st.s, s_all,   C*G, 2*D*C*G);
