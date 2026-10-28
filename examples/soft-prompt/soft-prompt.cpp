@@ -537,6 +537,46 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, 
     }
 }
 
+// samples the tokens of the outputs idx[k] with the samplers smpl[k] on c->n_threads threads (as llama_sampler_sample on
+// the CPU logits); buf[k]: the candidate buffer of sampler k
+static std::vector<llama_token> sample_outputs(sp_ctx * c, const std::vector<llama_sampler *> & smpl, const std::vector<int32_t> & idx,
+                                               std::vector<std::vector<llama_token_data>> & buf) {
+    const size_t n = smpl.size();
+    if (n == 0) {
+        return {};
+    }
+    std::vector<const float *> logits(n);
+    for (size_t k = 0; k < n; ++k) {
+        logits[k] = llama_get_logits_ith(c->ctx, idx[k]); // not thread safe: may reorder the outputs on first access
+        GGML_ASSERT(logits[k] != nullptr);
+    }
+    std::vector<llama_token> out(n);
+    auto work = [&](size_t k0, size_t k1) {
+        for (size_t k = k0; k < k1; ++k) {
+            auto & cur = buf[k];
+            cur.resize(c->n_vocab);
+            for (llama_token t = 0; t < c->n_vocab; ++t) {
+                cur[t] = llama_token_data{ t, logits[k][t], 0.0f };
+            }
+            llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+            llama_sampler_apply(smpl[k], &cur_p);
+            GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int64_t) cur_p.size);
+            out[k] = cur_p.data[cur_p.selected].id;
+            llama_sampler_accept(smpl[k], out[k]);
+        }
+    };
+    const size_t nt = std::min<size_t>(std::max(1, c->n_threads), n);
+    std::vector<std::thread> th;
+    for (size_t i = 1; i < nt; ++i) {
+        th.emplace_back(work, n*i/nt, n*(i + 1)/nt);
+    }
+    work(0, n/nt);
+    for (auto & t : th) {
+        t.join();
+    }
+    return out;
+}
+
 // samples a response for every prompt with the soft prompt theta (and the recurrent state, if not nullptr), n_seq sequences at a time;
 // out_tok [n_prompts][max_new], out_len: tokens generated (the end-of-generation token included), out_finished: 1 if it ended
 SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state, int32_t n_soft, int32_t n_prompts,
@@ -564,6 +604,7 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                 out_finished[w0 + s] = 0;
             }
 
+            std::vector<std::vector<llama_token_data>> buf(ns);
             std::vector<llama_pos>   pos(ns);
             std::vector<llama_token> last(ns, -1);
             std::vector<bool>        active(ns, true);
@@ -600,9 +641,17 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                     }
                 }
                 decode_items(c, items);
+                std::vector<llama_sampler *> sm;
+                std::vector<int32_t>         ix;
+                std::vector<std::vector<llama_token_data>> bo(outs.size());
                 for (auto [s, idx] : outs) {
                     pos[s] = pos0 + post_len[w0 + s];
-                    take(s, llama_sampler_sample(smpl[s], c->ctx, idx));
+                    sm.push_back(smpl[s]);
+                    ix.push_back(idx);
+                }
+                const auto toks = sample_outputs(c, sm, ix, bo);
+                for (size_t k = 0; k < outs.size(); ++k) {
+                    take(outs[k].first, toks[k]);
                 }
             }
 
@@ -624,8 +673,18 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                 g_prof.stop(c->ctx, sp_prof::DECODE);
                 g_prof.n_dec++;
                 g_prof.n_tok += (int64_t) items.size();
+                std::vector<llama_sampler *> sm;
+                std::vector<int32_t>         ix;
+                std::vector<std::vector<llama_token_data>> bs;
                 for (size_t k = 0; k < seqs.size(); ++k) {
-                    take(seqs[k], llama_sampler_sample(smpl[seqs[k]], c->ctx, (int32_t) k));
+                    sm.push_back(smpl[seqs[k]]);
+                    ix.push_back((int32_t) k);
+                    bs.push_back(std::move(buf[seqs[k]]));
+                }
+                const auto toks = sample_outputs(c, sm, ix, bs);
+                for (size_t k = 0; k < seqs.size(); ++k) {
+                    buf[seqs[k]] = std::move(bs[k]);
+                    take(seqs[k], toks[k]);
                 }
                 g_prof.stop(c->ctx, sp_prof::SAMPLE);
             }
