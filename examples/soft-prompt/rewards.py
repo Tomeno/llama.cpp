@@ -39,9 +39,15 @@ class RewardConfig:
                                 # as a word after </think>; prefix: the response starts with the reference (continuation)
     min_think: int = 0       # thinking shorter than this many tokens is penalized, linearly (0: off)
     w_short: float = 1.0     # empty thinking scores 0 on every other term, so this keeps "stop thinking" from winning
+    task_patterns: dict[str, list[str]] = field(default_factory=dict)  # task family -> patterns, instead of patterns
 
     def __post_init__(self):
         self._re = [re.compile(p, re.IGNORECASE) for p in self.patterns]
+        self._task_re = {t: [re.compile(p, re.IGNORECASE) for p in ps] for t, ps in self.task_patterns.items()}
+
+    def regexes(self, task: str | None) -> list:
+        """The meta-talk regexes of a task ("gsm8k", "ifeval:validate_end": its family before the colon)"""
+        return self._task_re.get((task or "").split(":")[0], self._re)
 
     @staticmethod
     def load_patterns(path: str) -> list[str]:
@@ -54,9 +60,9 @@ def split_sentences(text: str) -> list[str]:
 
 
 def thinking(text: str) -> tuple[str, str | None]:
-    """(thinking, answer part) - the answer part is None when </think> never came."""
+    """(thinking, answer part without the end of turn token) - the answer part is None when </think> never came."""
     i = text.find("</think>")
-    return (text, None) if i < 0 else (text[:i], text[i + len("</think>"):])
+    return (text, None) if i < 0 else (text[:i], re.sub(r"<\|im_end\|>\s*$", "", text[i + len("</think>"):]))
 
 
 def extract_answer(text: str) -> str:
@@ -123,11 +129,13 @@ def contains_answer(text: str, ref: str) -> bool:
     return re.search(r"(?<![0-9A-Za-z])" + re.escape(ref.strip()) + r"(?![0-9A-Za-z])", text, re.IGNORECASE) is not None
 
 
-def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: RewardConfig, think_toks=None) -> dict:
+def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: RewardConfig, think_toks=None,
+          task: str | None = None) -> dict:
     """Reward terms of one sample; the group length term and the total are added by finish()."""
     think, rest = thinking(text)
     sents = split_sentences(think)
-    n_meta = sum(1 for s in sents if any(r.search(s) for r in cfg._re))
+    rx = cfg.regexes(task)
+    n_meta = sum(1 for s in sents if any(r.search(s) for r in rx))
     counts = Counter(k for k in (_norm(s) for s in sents) if len(k) >= 16)
     n_rep = sum(c for c in counts.values() if c >= 3)
     out = {
@@ -175,6 +183,8 @@ def finish(r: dict, cfg: RewardConfig, extra: float = 0.0) -> float:
 def add_reward_args(ap):
     g = ap.add_argument_group("reward")
     g.add_argument("--patterns", help="meta-talk regexes, one per line, case-insensitive (default: built-in list)")
+    g.add_argument("--task-patterns", action="append", default=[], metavar="TASK=FILE[,FILE]",
+                   help="regexes for the prompts of a task family (the \"task\" field before the colon), instead of --patterns")
     g.add_argument("--w-meta", type=float, default=1.0)
     g.add_argument("--w-any", type=float, default=0.5)
     g.add_argument("--w-rep", type=float, default=1.0)
@@ -191,5 +201,9 @@ def add_reward_args(ap):
 
 def config_from_args(args) -> RewardConfig:
     pats = RewardConfig.load_patterns(args.patterns) if args.patterns else list(DEFAULT_PATTERNS)
+    by_task = {}
+    for spec in args.task_patterns:
+        t, files = spec.split("=", 1)
+        by_task[t] = [p for f in files.split(",") for p in RewardConfig.load_patterns(f)]
     return RewardConfig(pats, args.w_meta, args.w_any, args.w_rep, args.w_loop, args.w_correct, args.w_len, args.overlong,
-                        args.answer_mode, args.min_think, args.w_short)
+                        args.answer_mode, args.min_think, args.w_short, by_task)

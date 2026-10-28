@@ -15,7 +15,7 @@ from softprompt import Engine, Template
 
 
 class Prompts:
-    """Prompts ({"prompt", optional "answer"}) with their tokenized post part."""
+    """Prompts ({"prompt", optional "answer" and "task"}) with their tokenized post part."""
 
     def __init__(self, eng: Engine, tpl: Template, rows: list[dict]):
         self.rows = rows
@@ -46,7 +46,8 @@ def rollout(eng: Engine, theta: np.ndarray, prompts: Prompts, ids: list[int], ma
         text = eng.detokenize(toks)
         n_think = think_tokens(eng, toks)
         s = {"prompt": pi, "toks": toks, "text": text, "finished": fin, "tokens": len(toks), "think_tokens": n_think}
-        s.update(rewards.score(text, len(toks), max_new, prompts.rows[pi].get("answer"), cfg, toks[:n_think]))
+        row = prompts.rows[pi]
+        s.update(rewards.score(text, len(toks), max_new, row.get("answer"), cfg, toks[:n_think], row.get("task")))
         samples.append(s)
     if cfg.w_len:
         groups = defaultdict(list)

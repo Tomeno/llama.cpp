@@ -1,7 +1,8 @@
 """Verifiers of the IFEval constraints as encoded in allenai/RLVR-IFeval: a ground truth {"func_name", args...}.
 
 Ported from open-instruct (open_instruct/if_functions.py, Apache-2.0), with a few fixes: JSON may come in a code
-fence, bullets are "* " / "- " lines (not bold text or dividers), highlights are non-empty *...* spans on one line.
+fence, bullets are "* " / "- " lines (not bold text or dividers), highlights are non-empty *...* spans on one line,
+sections are counted as in the IFEval reference (splitter + number).
 The response language check needs langdetect and is not supported.
 """
 import json
@@ -79,10 +80,8 @@ def highlighted_sections(text, N):
 
 
 def sections(text, N, section_splitter):
-    parts = text.split(section_splitter)
-    if not parts[0].strip():
-        parts.pop(0)
-    return len(parts) == N
+    # as the IFEval reference: the splitter followed by a number marks a section
+    return len(re.findall(re.escape(section_splitter.strip()) + r"\s?\d+", text)) == N
 
 
 def json_format(text):
