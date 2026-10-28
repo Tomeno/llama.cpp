@@ -165,6 +165,10 @@ In the prompt cache the soft rows stand as placeholder tokens (the pad token), s
 them; a slot that has to start over restores the saved prefix instead of processing them. Not with media input or a
 draft model. The thinking is not split off into `reasoning_content` with this template.
 
+A file without a prefix (`train_state.py --no-soft-prompt`: no soft rows, no before / after text) holds only an initial
+state; the server then gives every slot that starts from position 0 that state before the first prompt token
+(`llama_memory_seq_seed` + `llama_memory_seq_state_set`), and the prompt is the plain chat format without a system turn.
+
 ### make_data.py, slice_model.py
 
 ```bash

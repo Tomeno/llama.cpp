@@ -1465,8 +1465,13 @@ private:
                 SRV_ERR("%s\n", e.what());
                 return false;
             }
-            SRV_INF("soft prompt '%s': a prefix of %zu tokens, state %.1f MiB\n", params_base.soft_prompt.c_str(),
-                    soft_prompt.tokens.size(), soft_prompt.state.size() / 1024.0 / 1024.0);
+            if (soft_prompt.tokens.empty()) {
+                SRV_INF("soft prompt '%s': no prefix, an initial state of %.1f MiB\n", params_base.soft_prompt.c_str(),
+                        soft_prompt.init_state.size() * sizeof(float) / 1024.0 / 1024.0);
+            } else {
+                SRV_INF("soft prompt '%s': a prefix of %zu tokens, state %.1f MiB\n", params_base.soft_prompt.c_str(),
+                        soft_prompt.tokens.size(), soft_prompt.state.size() / 1024.0 / 1024.0);
+            }
         }
 
         slots.clear();
@@ -4251,7 +4256,7 @@ private:
                         }
 
                         // the soft prompt prefix is not in the cache: restore its state instead of processing the placeholders
-                        if (!soft_prompt.empty() && n_past < (int) soft_prompt.tokens.size() &&
+                        if (!soft_prompt.tokens.empty() && n_past < (int) soft_prompt.tokens.size() &&
                                 slot.task->n_tokens() > (int) soft_prompt.tokens.size() &&
                                 soft_prompt.is_prefix_of(input_tokens.get_tokens())) {
                             if (!soft_prompt.restore(ctx_tgt, slot.id)) {
@@ -4309,6 +4314,13 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+
+                    // a soft prompt without a prefix: the initial state, before the first token
+                    if (!soft_prompt.empty() && soft_prompt.tokens.empty() && p0 == 0) {
+                        if (!soft_prompt.restore(ctx_tgt, slot.id)) {
+                            GGML_ABORT("failed to set the initial state\n");
+                        }
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;

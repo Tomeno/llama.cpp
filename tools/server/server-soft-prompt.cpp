@@ -15,6 +15,28 @@ static void decode_or_throw(llama_context * ctx, llama_batch batch, const char *
     }
 }
 
+// sets the recurrent state of seq_id from src, layer after layer; throws if src does not match the model's state
+static void set_state(llama_context * ctx, llama_seq_id seq_id, const float * src, int64_t n_left) {
+    const llama_model * model = llama_get_model(ctx);
+    for (int32_t il = 0; il < llama_model_n_layer(model); ++il) {
+        if (!llama_model_layer_is_recr(model, il)) {
+            continue;
+        }
+        const int64_t n = llama_memory_seq_state_get(ctx, seq_id, il, nullptr);
+        if (n <= 0) {
+            continue;
+        }
+        if (n > n_left || llama_memory_seq_state_set(ctx, seq_id, il, src) != n) {
+            throw std::runtime_error("soft prompt: the state does not match the recurrent state of layer " + std::to_string(il));
+        }
+        src    += n;
+        n_left -= n;
+    }
+    if (n_left != 0) {
+        throw std::runtime_error("soft prompt: the state has " + std::to_string(n_left) + " values more than the model's recurrent state");
+    }
+}
+
 static void decode_tokens(llama_context * ctx, std::vector<llama_token> toks) {
     const int n_batch = (int) llama_n_batch(ctx);
     for (int i = 0; i < (int) toks.size(); i += n_batch) {
@@ -52,6 +74,20 @@ void server_soft_prompt::init(llama_context * ctx, const std::string & path) {
     llama_memory_t mem = llama_get_memory(ctx);
     llama_memory_seq_rm(mem, 0, -1, -1);
 
+    if (before.empty() && after.empty() && n_soft == 0) {
+        if (!st || st->type != GGML_TYPE_F32) {
+            throw std::runtime_error("soft prompt: " + path + " has neither a prefix nor an F32 state");
+        }
+        init_state.assign((const float *) st->data, (const float *) st->data + ggml_nelements(st));
+        // checks the size on a seeded sequence
+        if (!llama_memory_seq_seed(ctx, 0)) {
+            throw std::runtime_error("soft prompt: failed to seed a sequence");
+        }
+        set_state(ctx, 0, init_state.data(), (int64_t) init_state.size());
+        llama_memory_seq_rm(mem, 0, -1, -1);
+        return;
+    }
+
     decode_tokens(ctx, before);
 
     // embedding rows of M-RoPE models carry 4 positions each, section-major; [p, p, p, 0] is what a text token gets
@@ -87,25 +123,7 @@ void server_soft_prompt::init(llama_context * ctx, const std::string & path) {
         if (st->type != GGML_TYPE_F32) {
             throw std::runtime_error("soft prompt: soft_prompt.state is not F32");
         }
-        const float * src = (const float *) st->data;
-        int64_t n_left = ggml_nelements(st);
-        for (int32_t il = 0; il < llama_model_n_layer(model); ++il) {
-            if (!llama_model_layer_is_recr(model, il)) {
-                continue;
-            }
-            const int64_t n = llama_memory_seq_state_get(ctx, 0, il, nullptr);
-            if (n <= 0) {
-                continue;
-            }
-            if (n > n_left || llama_memory_seq_state_set(ctx, 0, il, src) != n) {
-                throw std::runtime_error("soft prompt: the state does not match the recurrent state of layer " + std::to_string(il));
-            }
-            src    += n;
-            n_left -= n;
-        }
-        if (n_left != 0) {
-            throw std::runtime_error("soft prompt: the state has " + std::to_string(n_left) + " values more than the model's recurrent state");
-        }
+        set_state(ctx, 0, (const float *) st->data, ggml_nelements(st));
     }
 
     decode_tokens(ctx, after);
@@ -125,6 +143,17 @@ void server_soft_prompt::init(llama_context * ctx, const std::string & path) {
 
 bool server_soft_prompt::restore(llama_context * ctx, llama_seq_id seq_id) const {
     llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+    if (tokens.empty()) {
+        if (!llama_memory_seq_seed(ctx, seq_id)) {
+            return false;
+        }
+        try {
+            set_state(ctx, seq_id, init_state.data(), (int64_t) init_state.size());
+        } catch (const std::exception &) {
+            return false;
+        }
+        return true;
+    }
     return llama_state_seq_set_data(ctx, state.data(), state.size(), seq_id) == state.size();
 }
 
