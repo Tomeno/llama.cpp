@@ -72,6 +72,10 @@ public:
     // gives seq_id a cell of its own now (a device copy of the shared cell, e.g. after seq_cp) instead of at the
     // next ubatch, so that seq_state_s can set its state; returns false on error
     bool seq_unshare(llama_seq_id seq_id);
+
+    // gives the empty sequence seq_id a zeroed cell before any token (pos -1, kept by the next decode), so that its
+    // initial state can be set; false if the sequence is not empty or no cell is free
+    bool seq_seed(llama_seq_id seq_id);
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())

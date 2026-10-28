@@ -12,6 +12,9 @@ Data and validation as train_nll.py. With --forks (dpo.py pairs that share a pre
 point where instruction talk starts), the loss adds w_fork * -log sigmoid(beta * m) per pair, m the DPO margin against
 the starting state; only the tokens after the shared prefix are scored. The result is a soft prompt file that also holds the state (probe.py and
 generate.py use it with --init-file).
+
+With --no-soft-prompt there is no prefix at all (no soft prompt, no before / after text): the state is the initial state
+of the model, before the first token of the prompt; s0 is zero then, so the scales come from the state of the --init-file.
 """
 
 from __future__ import annotations
@@ -48,15 +51,26 @@ def main():
     ap.add_argument("--beta", type=float, default=0.1)
     ap.add_argument("--w-fork", type=float, default=1.0, help="weight of the fork DPO term")
     ap.add_argument("--scale-floor", type=float, default=0.1, help="minimum head scale, relative to the median")
+    ap.add_argument("--no-soft-prompt", action="store_true",
+                    help="no prefix: tune the initial state before the prompt (from the state of --init-file, if any)")
     rollout.add_sampling_args(ap)
     rewards.add_reward_args(ap)
     args = ap.parse_args()
 
+    init_file = args.init_file
+    if args.no_soft_prompt:
+        args.init_file, args.init_text, args.before, args.after = None, "", "", ""
     eng, theta, tpl = setup(args, n_seq=max(args.par, 2 * args.pairs))
+    args.init_file = init_file
     if eng.n_state == 0 or eng.n_state % (HEAD * HEAD):
         sys.exit(f"the model has {eng.n_state} recurrent state values, not a stack of {HEAD} x {HEAD} matrices")
     s0 = eng.get_state(theta).reshape(-1, HEAD, HEAD)
-    scale = np.sqrt(np.mean(np.square(s0, dtype=np.float64), axis=(1, 2))).astype(np.float32)
+    st0 = load_state(args.init_file)
+    if args.no_soft_prompt and st0 is None:
+        sys.exit("--no-soft-prompt needs an --init-file with a state (the scales come from it)")
+    # without a prefix s0 is zero: the scales of the starting state instead
+    ref = st0.reshape(s0.shape) if args.no_soft_prompt and st0 is not None else s0
+    scale = np.sqrt(np.mean(np.square(ref, dtype=np.float64), axis=(1, 2))).astype(np.float32)
     scale = np.maximum(scale, args.scale_floor * float(np.median(scale)))
     print(f"state: {len(s0)} matrices, head scale median {np.median(scale):.2e}, min {scale.min():.2e}, max {scale.max():.2e}",
           file=sys.stderr)
@@ -111,7 +125,6 @@ def main():
 
     # an --init-file that holds a state (a previous run) continues from it
     z0 = np.zeros_like(s0)
-    st0 = load_state(args.init_file)
     if st0 is not None:
         z0 = (st0.reshape(s0.shape) - s0) / scale[:, None, None]
         print(f"continuing from the state in {args.init_file}, drift {np.sqrt(np.mean(z0 ** 2)):.3f} head RMS", file=sys.stderr)

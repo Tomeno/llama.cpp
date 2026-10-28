@@ -250,6 +250,18 @@ static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, con
         }
     };
     const bool any = pos > 0;
+    if (!any) {
+        // no prefix: the sequences have no cell yet, the states go into seeded ones
+        for (int s = 0; s < ns; ++s) {
+            if (state_of(s)) {
+                if (!llama_memory_seq_seed(c->ctx, s)) {
+                    throw std::runtime_error("failed to seed sequence " + std::to_string(s));
+                }
+                set_state(c, s, state_of(s));
+            }
+        }
+        return pos;
+    }
     for (int s = 0; s < ns && any; ++s) {
         if (rep_s[s] == s && rep_t[s] != s) {
             copy(rep_t[s], s);
@@ -412,7 +424,11 @@ SP_API int64_t sp_n_state(const sp_ctx * c) { return c->n_state; }
 // the recurrent state after the prefix (before + soft prompt theta): out [n_state]
 SP_API int32_t sp_get_state(sp_ctx * c, const float * theta, int32_t n_soft, float * out) {
     try {
-        prefix(c, { theta }, {}, n_soft);
+        if (prefix(c, { theta }, {}, n_soft) == 0) {
+            // no prefix: the initial state is zero
+            std::fill(out, out + c->n_state, 0.0f);
+            return 0;
+        }
         for (auto [il, n] : c->state_layers) {
             if (llama_memory_seq_state_get(c->ctx, 0, il, out) != n) {
                 throw std::runtime_error("failed to get the state of layer " + std::to_string(il));

@@ -158,6 +158,10 @@ LLAMA_API float llama_get_logprob_ith    (struct llama_context * ctx, int32_t i)
 // so that llama_memory_seq_state_set works before the next decode; false on error
 LLAMA_API bool llama_memory_seq_unshare(struct llama_context * ctx, llama_seq_id seq_id);
 
+// gives the empty sequence seq_id a zeroed recurrent cell before any token, so that llama_memory_seq_state_set can set
+// its initial state (a state without a prefix); its first decode starts at position 0 from that state; false on error
+LLAMA_API bool llama_memory_seq_seed(struct llama_context * ctx, llama_seq_id seq_id);
+
 // true for the layers of the model that keep a recurrent state (hybrid models: not the attention layers)
 LLAMA_API bool llama_model_layer_is_recr(const struct llama_model * model, int32_t il);
 

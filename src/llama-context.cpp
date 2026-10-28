@@ -4471,6 +4471,15 @@ bool llama_memory_seq_unshare(llama_context * ctx, llama_seq_id seq_id) {
     return mem->seq_unshare(seq_id);
 }
 
+bool llama_memory_seq_seed(llama_context * ctx, llama_seq_id seq_id) {
+    auto * mem = get_mem_recr(ctx);
+    if (!mem) {
+        return false;
+    }
+    ctx->synchronize();
+    return mem->seq_seed(seq_id);
+}
+
 // llama adapter API
 
 int32_t llama_set_adapters_lora(

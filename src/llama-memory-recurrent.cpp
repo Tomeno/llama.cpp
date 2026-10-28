@@ -218,8 +218,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 }
                 return false;
             }
-            // invalidate tails which will be cleared
-            if (p0 <= cell.pos && cell.pos < p1) {
+            // invalidate tails which will be cleared (a seeded cell, pos -1, goes with a removal from 0)
+            if ((p0 <= cell.pos && cell.pos < p1) || (p0 == 0 && cell.pos < 0)) {
                 tail_id = -1;
             }
         }
@@ -232,7 +232,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     }
 
     for (uint32_t i = 0; i < size; ++i) {
-        if (cells[i].pos >= p0 && cells[i].pos < p1) {
+        if ((cells[i].pos >= p0 && cells[i].pos < p1) || (p0 == 0 && cells[i].pos < 0 && !cells[i].is_empty())) {
             if (seq_id < 0) {
                 cells[i].seq_id.clear();
             } else if (cells[i].has_seq_id(seq_id)) {
@@ -417,6 +417,35 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+bool llama_memory_recurrent::seq_seed(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || cells[seq_id].tail >= 0) {
+        return false;
+    }
+    int32_t dst = -1;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].is_empty()) {
+            dst = i;
+            break;
+        }
+    }
+    if (dst < 0) {
+        return false;
+    }
+    for (const auto * tl : { &r_l, &s_l, &p_l }) {
+        for (ggml_tensor * t : *tl) {
+            if (t) {
+                ggml_backend_tensor_memset(t, 0, dst*t->nb[1], t->nb[1]);
+            }
+        }
+    }
+    // src == dst: the state is the cell's own, so the next decode does not clear it
+    cells[dst].pos = -1;
+    cells[dst].src = dst;
+    cells[dst].seq_id.insert(seq_id);
+    cells[seq_id].tail = dst;
+    return true;
 }
 
 bool llama_memory_recurrent::seq_unshare(llama_seq_id seq_id) {
