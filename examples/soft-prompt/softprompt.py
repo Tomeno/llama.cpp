@@ -295,7 +295,7 @@ def add_common_args(ap: argparse.ArgumentParser):
     g = ap.add_argument_group("model and runtime")
     g.add_argument("-m", "--model", required=True)
     g.add_argument("-ngl", "--n-gpu-layers", type=int, default=999)
-    g.add_argument("-c", "--ctx", type=int, default=32768, help="context size (per sequence for hybrid/recurrent models)")
+    g.add_argument("-c", "--ctx", type=int, default=32768, help="KV cells, shared by the parallel sequences (unified KV): --par x (prompt + budget) must fit")
     g.add_argument("-b", "--batch", type=int, default=2048)
     g.add_argument("--par", type=int, default=32, help="parallel sequences; each holds a full sequence state")
     g.add_argument("-t", "--threads", type=int, default=0)
