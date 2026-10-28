@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 import ifeval
 
@@ -89,14 +90,33 @@ def _norm(s: str) -> str:
     return re.sub(r"[^0-9a-z]", "", s.lower())
 
 
-_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+# numbers, as in answers: 1,250.00 / -3 / \frac{3}{4} / \dfrac34 / 3/4
+_NUM = re.compile(r"(-)?\s*\\[dt]?frac\s*(?:\{\s*(-?\d+)\s*\}|(\d))\s*(?:\{\s*(-?\d+)\s*\}|(\d))"
+                  r"|(-?\d[\d,]*(?:\.\d+)?)(?:\s*/\s*(\d+)(?![\d.]))?")
+
+
+def _numbers(s: str) -> list[Fraction]:
+    out = []
+    for m in _NUM.finditer(s):
+        neg, fa, fa1, fb, fb1, x, den = m.groups()
+        try:
+            if x is None:
+                v = Fraction(int(fa or fa1), int(fb or fb1))
+                out.append(-v if neg else v)
+            else:
+                v = Fraction(x.replace(",", ""))
+                out.append(v / int(den) if den else v)
+        except (ValueError, ZeroDivisionError):
+            pass
+    return out
 
 
 def answer_matches(got: str, ref: str) -> bool:
-    # a numeric reference matches the last number of the answer: "$1,250.00", "x = 18"
-    if re.fullmatch(r"\s*-?[\d,]+(\.\d+)?\s*", ref):
-        nums = _NUM.findall(got)
-        return bool(nums) and float(nums[-1].replace(",", "")) == float(ref.replace(",", ""))
+    # a numeric reference matches the last number of the answer: "$1,250.00", "x = 18", "\frac{3}{4}"
+    r_num = _numbers(ref)
+    if len(r_num) == 1 and re.fullmatch(r"[\s$\\{}()dfrac0-9.,/-]*", ref):
+        nums = _numbers(got)
+        return bool(nums) and nums[-1] == r_num[0]
     g, r = _norm(got), _norm(ref)
     if not r:
         return False
@@ -151,8 +171,8 @@ def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: Rewar
     }
     if cfg.min_think > 0 and think_toks is not None and len(think_toks) < cfg.min_think:
         out["r_short"] = (len(think_toks) - cfg.min_think) / cfg.min_think
-    if isinstance(answer, dict):  # an IFEval constraint, checked on the response after the thinking
-        out["correct"] = rest is not None and ifeval.check(rest, answer)
+    if isinstance(answer, (dict, list)):  # IFEval constraints (all must hold), checked on the response after the thinking
+        out["correct"] = rest is not None and all(ifeval.check(rest, a) for a in (answer if isinstance(answer, list) else [answer]))
     elif answer:
         if cfg.answer_mode == "prefix":
             out["correct"] = starts_with_answer(text, answer)
