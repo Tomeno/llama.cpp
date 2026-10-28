@@ -15,7 +15,8 @@ from softprompt import Engine, Template
 
 
 class Prompts:
-    """Prompts ({"prompt", optional "answer" and "task"}) with their tokenized post part."""
+    """Prompts ({"prompt", optional "answer", "task" and "gen_max", the token budget of the prompt instead of
+    --gen-max}) with their tokenized post part."""
 
     def __init__(self, eng: Engine, tpl: Template, rows: list[dict]):
         self.rows = rows
@@ -40,14 +41,19 @@ def rollout(eng: Engine, theta: np.ndarray, prompts: Prompts, ids: list[int], ma
             sampling: dict, seed: int, reward_cmd: str | None = None, state: np.ndarray | None = None) -> list[dict]:
     """One sample per entry of ids (indices into prompts), with rewards; samples of the same prompt form a group.
     state: the recurrent state after the prefix (initial state tuning), None: the one the soft prompt leaves."""
-    gen = eng.generate(theta, [prompts.posts[i] for i in ids], max_new, seed=seed, state=state, **sampling)
+    budget = [int(prompts.rows[i].get("gen_max", max_new)) for i in ids]
+    gen = [None] * len(ids)
+    for b in sorted(set(budget)):  # one call per token budget
+        js = [j for j, x in enumerate(budget) if x == b]
+        for j, g in zip(js, eng.generate(theta, [prompts.posts[ids[j]] for j in js], b, seed=seed, state=state, **sampling)):
+            gen[j] = g
     samples = []
-    for pi, (toks, fin) in zip(ids, gen):
+    for pi, b, (toks, fin) in zip(ids, budget, gen):
         text = eng.detokenize(toks)
         n_think = think_tokens(eng, toks)
         s = {"prompt": pi, "toks": toks, "text": text, "finished": fin, "tokens": len(toks), "think_tokens": n_think}
         row = prompts.rows[pi]
-        s.update(rewards.score(text, len(toks), max_new, row.get("answer"), cfg, toks[:n_think], row.get("task")))
+        s.update(rewards.score(text, len(toks), b, row.get("answer"), cfg, toks[:n_think], row.get("task")))
         samples.append(s)
     if cfg.w_len:
         groups = defaultdict(list)
