@@ -6,6 +6,8 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 
+import ifeval
+
 # recitation of a training-time instruction and checking compliance with it, as seen in EdgeRock-4B outputs
 DEFAULT_PATTERNS = [
     r"meta[- ]?instruction",
@@ -81,7 +83,14 @@ def _norm(s: str) -> str:
     return re.sub(r"[^0-9a-z]", "", s.lower())
 
 
+_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
 def answer_matches(got: str, ref: str) -> bool:
+    # a numeric reference matches the last number of the answer: "$1,250.00", "x = 18"
+    if re.fullmatch(r"\s*-?[\d,]+(\.\d+)?\s*", ref):
+        nums = _NUM.findall(got)
+        return bool(nums) and float(nums[-1].replace(",", "")) == float(ref.replace(",", ""))
     g, r = _norm(got), _norm(ref)
     if not r:
         return False
@@ -134,7 +143,9 @@ def score(text: str, n_tokens: int, max_new: int, answer: str | None, cfg: Rewar
     }
     if cfg.min_think > 0 and think_toks is not None and len(think_toks) < cfg.min_think:
         out["r_short"] = (len(think_toks) - cfg.min_think) / cfg.min_think
-    if answer:
+    if isinstance(answer, dict):  # an IFEval constraint, checked on the response after the thinking
+        out["correct"] = rest is not None and ifeval.check(rest, answer)
+    elif answer:
         if cfg.answer_mode == "prefix":
             out["correct"] = starts_with_answer(text, answer)
         elif cfg.answer_mode == "contains":
