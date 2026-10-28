@@ -190,6 +190,9 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // the ubatch neither moves nor clears states: s_copy(i) == head + i for all i (no side effects, unlike s_copy)
+    bool is_in_place() const;
+
 private:
     const llama_memory_status status;
 

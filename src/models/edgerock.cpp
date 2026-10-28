@@ -56,15 +56,7 @@ static rma_counts rma_get_counts(const llama_ubatch & ubatch, int64_t P) {
 
 // true if the ubatch moves or clears recurrent states (then every state goes through the gather in build_rs)
 static bool rs_moves(const llama_memory_recurrent_context * mctx) {
-    if (mctx->get_rs_z() >= 0) {
-        return true;
-    }
-    for (uint32_t i = 0; i < mctx->get_n_rs(); ++i) {
-        if (mctx->s_copy(i) != (int32_t) (mctx->get_head() + i)) {
-            return true;
-        }
-    }
-    return false;
+    return !mctx->is_in_place();
 }
 
 // gather indices and masks of the commits that fall inside the ubatch, computed from the positions
@@ -75,7 +67,8 @@ public:
         counts(rma_get_counts(ubatch, n_chunk)),
         n_commit(counts.n_commit), read0(counts.read0), n_read(counts.n_read),
         moves(rs_moves(mctx)),
-        use_comm(n_commit > 0 || read0 < n_read || moves) {}
+        use_comm(n_commit > 0 || read0 < n_read || moves),
+        pend_in_place(n_commit == 0 && !moves) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_ASSERT(ubatch->n_seq_tokens == n_seq_tokens && ubatch->n_seqs == n_seqs);
@@ -127,7 +120,23 @@ public:
             ggml_backend_tensor_set(commit_idx, commit.data(), 0, ggml_nbytes(commit_idx));
             ggml_backend_tensor_set(commit_on,  on.data(),     0, ggml_nbytes(commit_on));
         }
-        ggml_backend_tensor_set(pend_idx,   pend.data(),   0, ggml_nbytes(pend_idx));
+        if (pend_idx) {
+            ggml_backend_tensor_set(pend_idx, pend.data(), 0, ggml_nbytes(pend_idx));
+        }
+        if (pend_rows) {
+            std::vector<int64_t> rows(T*n_head_kv*n_seqs);
+            for (int64_t s = 0; s < n_seqs; ++s) {
+                for (int64_t g = 0; g < n_head_kv; ++g) {
+                    for (int64_t t = 0; t < T; ++t) {
+                        rows[(s*n_head_kv + g)*T + t] = g*P + ubatch->pos[s*T + t] % P;
+                    }
+                }
+            }
+            ggml_backend_tensor_set(pend_rows, rows.data(), 0, ggml_nbytes(pend_rows));
+        }
+        if (sink) {
+            ggml_backend_tensor_memset(sink, 0, 0, ggml_nbytes(sink));
+        }
         if (read_sel) {
             ggml_backend_tensor_set(read_sel, sel.data(), 0, ggml_nbytes(read_sel));
         }
@@ -149,11 +158,14 @@ public:
     const int64_t    n_read;
     const bool       moves;    // the ubatch moves or clears recurrent states
     const bool       use_comm; // the committed records are needed (else they stay in place, untouched)
+    const bool       pend_in_place; // no commit, no moves: the new pending records are written to their slots in the cache
 
     ggml_tensor * commit_idx = nullptr; // I32 [n_chunk, n_head_kv, n_seqs, n_commit]
     ggml_tensor * commit_on  = nullptr; // F32 [n_seqs, n_commit], 1 if the commit happens
     ggml_tensor * pend_idx   = nullptr; // I32 [n_chunk, n_head_kv, n_seqs]
+    ggml_tensor * pend_rows  = nullptr; // I64 [n_seq_tokens*n_head_kv, n_seqs], pending slot g*n_chunk + pos % n_chunk of each token
     ggml_tensor * read_sel   = nullptr; // F32 [n_seq_tokens, n_seqs, n_read], 1 if the token reads that state (n_read > 1)
+    ggml_tensor * sink       = nullptr; // F32 [n_head_kv], zeros: the logit of the zero sink
 };
 
 void llama_model_edgerock::load_arch_hparams(llama_model_loader & ml) {
@@ -256,12 +268,21 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_set_input(inp_rma->commit_idx);
             ggml_set_input(inp_rma->commit_on);
         }
-        inp_rma->pend_idx = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, P, n_head_kv, S);
-        ggml_set_input(inp_rma->pend_idx);
+        if (inp_rma->pend_in_place) {
+            inp_rma->pend_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I64, ubatch.n_seq_tokens*n_head_kv, S);
+            ggml_set_input(inp_rma->pend_rows);
+        } else {
+            inp_rma->pend_idx = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, P, n_head_kv, S);
+            ggml_set_input(inp_rma->pend_idx);
+        }
 
         if (inp_rma->n_read > 1) {
             inp_rma->read_sel = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, ubatch.n_seq_tokens, S, inp_rma->n_read);
             ggml_set_input(inp_rma->read_sel);
+        }
+        if (inp_rma->read0 < inp_rma->n_read) {
+            inp_rma->sink = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head_kv);
+            ggml_set_input(inp_rma->sink);
         }
 
         inp_mem = (llm_graph_input_mem_rma *) res->add_input(std::move(inp_rma));
@@ -417,10 +438,11 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
     ggml_tensor * comm_s = nullptr;
     ggml_tensor * comm_f = nullptr;
     if (comm) {
-        comm_k = ggml_cont(ctx0, ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], 0));
-        comm_v = ggml_cont(ctx0, ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], D*C*G*esz));
-        comm_s = ggml_cont(ctx0, ggml_view_3d(ctx0, comm,    C, G, S,    C*esz,       comm->nb[1], 2*D*C*G*esz));
-        comm_f = ggml_cont(ctx0, ggml_view_3d(ctx0, comm,    C, G, S,    C*esz,       comm->nb[1], (2*D*C*G + C*G)*esz));
+        comm_k = ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], 0);
+        comm_v = ggml_view_4d(ctx0, comm, D, C, G, S, D*esz, D*C*esz, comm->nb[1], D*C*G*esz);
+        // the scores and flags are small; contiguous copies, as not every op takes strided rows (CUDA scale)
+        comm_s = ggml_cont(ctx0, ggml_view_3d(ctx0, comm, C, G, S, C*esz, comm->nb[1], 2*D*C*G*esz));
+        comm_f = ggml_cont(ctx0, ggml_view_3d(ctx0, comm, C, G, S, C*esz, comm->nb[1], (2*D*C*G + C*G)*esz));
     }
 
     // pending slots followed by the records of the ubatch, the commit and pending indices point into these
@@ -483,7 +505,7 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
         });
     }
 
-    // read: attention of every token over the committed records it can see, plus a zero sink
+    // read: attention of every token over the committed records it can see, plus a zero sink (a zero logit and value)
     // the query rows of a KV head are grouped as [D, Hg*T, G, S] so that the masks broadcast over them
     ggml_tensor * qg = ggml_reshape_4d(ctx0, q, D*Hg, G, T, S);
     qg = ggml_cont(ctx0, ggml_permute(ctx0, qg, 0, 2, 1, 3));
@@ -494,18 +516,16 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
     for (int64_t ir = inp_mem->read0; ir < inp_mem->n_read; ++ir) {
         const rma_state & st = states[ir];
 
-        ggml_tensor * ks = ggml_pad(ctx0, st.k, 0, 1, 0, 0);                                   // [D, C + 1, G, S]
-        ggml_tensor * vs = ggml_pad(ctx0, st.v, 0, 1, 0, 0);
-        vs = ggml_cont(ctx0, ggml_transpose(ctx0, vs));                                        // [C + 1, D, G, S]
-
         ggml_tensor * bias = ggml_scale_bias(ctx0, st.f, RMA_INVALID, -RMA_INVALID);
-        bias = ggml_pad(ctx0, ggml_reshape_4d(ctx0, bias, C, 1, G, S), 1, 0, 0, 0);           // [C + 1, 1, G, S]
+        bias = ggml_reshape_4d(ctx0, bias, C, 1, G, S);                                        // [C, 1, G, S]
 
-        ggml_tensor * kq = ggml_mul_mat(ctx0, ks, qg);                                         // [C + 1, Hg*T, G, S]
+        ggml_tensor * kq = ggml_mul_mat(ctx0, st.k, qg);                                       // [C, Hg*T, G, S]
         kq = ggml_scale(ctx0, kq, 1.0f/sqrtf(float(D)));
-        kq = ggml_soft_max(ctx0, ggml_add(ctx0, kq, bias));
+        kq = ggml_soft_max_ext(ctx0, ggml_add(ctx0, kq, bias), nullptr, 1.0f, 0.0f);
+        ggml_soft_max_add_sinks(kq, inp_mem->sink);
 
-        ggml_tensor * out = ggml_mul_mat(ctx0, vs, kq);                                        // [D, Hg*T, G, S]
+        // out_prod sums over the records (dim 1 of both), so V is read as stored
+        ggml_tensor * out = ggml_out_prod(ctx0, st.v, ggml_transpose(ctx0, kq));               // [D, Hg*T, G, S]
         out = ggml_reshape_4d(ctx0, out, D*Hg, T, G, S);
         out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3));                            // [D*Hg, G, T, S]
         out = ggml_reshape_3d(ctx0, out, D*H, T, S);
@@ -520,31 +540,43 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
     }
     if (read) {
         cb(read, "mem_read", il);
+        // the read may use the committed records in place: it must run before they are stored
+        ggml_build_forward_expand(gf, read);
     }
 
     // store the records
     {
         const rma_state & st = states.back();
 
-        ggml_tensor * new_pk = ggml_get_rows(ctx0, ext_k, inp_mem->pend_idx);                  // [D, P, G, S]
-        ggml_tensor * new_pv = ggml_get_rows(ctx0, ext_v, inp_mem->pend_idx);
-        ggml_tensor * new_ps = ggml_get_rows(ctx0, ext_s, inp_mem->pend_idx);                  // [1, P, G, S]
-
         auto store = [&](ggml_tensor * src, ggml_tensor * dst_all, int64_t n, int64_t offset) {
             ggml_tensor * dst = ggml_view_2d(ctx0, dst_all, n, S, dst_all->nb[1], kv_head*dst_all->nb[1] + offset*esz);
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, src, n, S), dst));
         };
 
-        store(new_pk, r_all, D*P*G, 0);
-        store(new_pv, r_all, D*P*G, D*P*G);
-        store(new_ps, r_all,   P*G, 2*D*P*G);
+        if (inp_mem->pend_in_place) {
+            // the other pending slots keep their records; the slots of the ubatch sequences as [n, P*G, S]
+            auto slots = [&](int64_t n, int64_t offset) {
+                return ggml_view_3d(ctx0, r_all, n, P*G, S, n*esz, r_all->nb[1], kv_head*r_all->nb[1] + offset*esz);
+            };
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots(D, 0),       ggml_reshape_3d(ctx0, k, D, T*G, S), inp_mem->pend_rows));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots(D, D*P*G),   ggml_reshape_3d(ctx0, v, D, T*G, S), inp_mem->pend_rows));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots(1, 2*D*P*G), ggml_reshape_3d(ctx0, score, 1, T*G, S), inp_mem->pend_rows));
+        } else {
+            ggml_tensor * new_pk = ggml_get_rows(ctx0, ext_k, inp_mem->pend_idx);              // [D, P, G, S]
+            ggml_tensor * new_pv = ggml_get_rows(ctx0, ext_v, inp_mem->pend_idx);
+            ggml_tensor * new_ps = ggml_get_rows(ctx0, ext_s, inp_mem->pend_idx);              // [1, P, G, S]
+
+            store(new_pk, r_all, D*P*G, 0);
+            store(new_pv, r_all, D*P*G, D*P*G);
+            store(new_ps, r_all,   P*G, 2*D*P*G);
+        }
 
         if (inp_mem->n_commit > 0) {
             store(st.k, s_all, D*C*G, 0);
             store(st.v, s_all, D*C*G, D*C*G);
             store(st.s, s_all,   C*G, 2*D*C*G);
             store(st.f, s_all,   C*G, 2*D*C*G + C*G);
-        } else if (comm) {
+        } else if (inp_mem->moves) {
             store(comm, s_all, hparams.n_embd_s(il), 0); // unchanged, but moved or cleared
         }
     }

@@ -71,14 +71,19 @@ qwen35moe does).
   `[d, capacity, kv_heads]` + scores + valid flags). This needed per-layer state sizes: `llama_hparams::n_embd_r(il)` /
   `n_embd_s(il)` (the recurrent memory now allocates, saves and loads per layer). Consequences: `seq_cp`, `seq_rm`,
   state save/load, server checkpoints and slot files all handle RMA with no special code.
-- **RMA in the graph** uses only standard ggml ops (`top_k`, batched `get_rows`, `mul_mat`, `soft_max`, `pad`,
-  `scale_bias`, `step`, `concat`), so it can run on any backend. Commit points are derived from positions (they
+- **RMA in the graph** uses only standard ggml ops (`top_k`, batched `get_rows`, `set_rows`, `mul_mat`, `out_prod`,
+  `soft_max` with sinks, `scale_bias`, `step`, `concat`), so it can run on any backend. Commit points are derived from positions (they
   start at 0 and are consecutive per sequence; the pending count is `pos % chunk`): a ubatch is split into segments
   at chunk boundaries; for every possible commit the graph gathers the chunk's records (from the stored pending rows
   and the ubatch's new records), takes the top `capacity` scores over bank + chunk, and blends the result in with a
   per-sequence 0/1 input (so the graph shape only depends on the ubatch shape). Each segment reads its own bank
   state. Indices and masks come from `llm_graph_input_mem_rma::set_input`. Invalid records get a large negative
-  logit; the sink is a zero key/value slot.
+  logit; the sink is a zero logit (soft_max sink) with a zero value.
+- **Decode reads the states in place**: when a ubatch moves no recurrent state (`is_in_place`), `build_rs` returns
+  views of the cache rows instead of gathering copies; the RMA read multiplies the committed K / V views directly
+  (`out_prod` sums over the records, so V needs no transpose), and without a commit the new pending records are
+  written to their slots with `set_rows`. Copies of the whole state per token (~130 MiB per sequence) made batched
+  generation scale linearly with the number of sequences; this cut the decode time of 24 parallel sequences by 2.3x.
 - Cost/limit: the graph has `ceil(n_seq_tokens / chunk) + 1` reads and commits per memory layer, so very small
   commit chunks with huge ubatches blow up the graph (tiny test models: keep `-ub <= 64`). For EdgeRock-4B (chunk 256)
   a 2048-token ubatch has 9 reads per layer.

@@ -59,7 +59,7 @@ static std::string g_error;
 
 // phase timing (SP_PROFILE=1): synchronizes after every phase and prints a summary after every sp_score call
 struct sp_prof {
-    enum { PREFIX, DECODE, LOGPROBS, N };
+    enum { PREFIX, DECODE, LOGPROBS, SAMPLE, N };
     bool    on = getenv("SP_PROFILE") != nullptr;
     int64_t t[N] = {};
     int64_t n_dec = 0, n_tok = 0, n_out = 0;
@@ -619,13 +619,26 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                 if (items.empty()) {
                     break;
                 }
+                g_prof.start(c->ctx);
                 decode_items(c, items);
+                g_prof.stop(c->ctx, sp_prof::DECODE);
+                g_prof.n_dec++;
+                g_prof.n_tok += (int64_t) items.size();
                 for (size_t k = 0; k < seqs.size(); ++k) {
                     take(seqs[k], llama_sampler_sample(smpl[seqs[k]], c->ctx, (int32_t) k));
                 }
+                g_prof.stop(c->ctx, sp_prof::SAMPLE);
             }
             for (auto * s : smpl) {
                 llama_sampler_free(s);
+            }
+        }
+        if (g_prof.on) {
+            fprintf(stderr, "sp_generate: decode %.2f s, sampling %.2f s; %lld steps, %lld tokens\n",
+                    g_prof.t[sp_prof::DECODE]*1e-6, g_prof.t[sp_prof::SAMPLE]*1e-6, (long long) g_prof.n_dec, (long long) g_prof.n_tok);
+            g_prof = sp_prof();
+            if (!g_op_prof.t.empty()) {
+                op_prof_print();
             }
         }
         return 0;

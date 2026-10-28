@@ -299,6 +299,9 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // no state moves or is cleared: build_rs reads the states in place (no gather)
+    bool in_place = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
