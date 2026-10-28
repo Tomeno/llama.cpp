@@ -705,6 +705,7 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    std::string soft_prompt;    // soft prompt file (examples/soft-prompt) in front of every prompt
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

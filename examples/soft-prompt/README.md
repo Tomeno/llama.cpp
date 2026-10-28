@@ -150,6 +150,21 @@ LLM judge).
 python generate.py -m M.gguf --init-file sp.gguf -p "What is 17*23?" -n 2048
 ```
 
+### llama-server
+
+A trained file (soft prompt, or soft prompt + state) can be served: `--soft-prompt` evaluates the prefix once at load
+time and every request starts from it. It replaces the system turn, so requests should have only user and assistant
+messages, and the chat template has to give the prompt format used in training (for EdgeRock the official one, which
+opens `<think>`):
+
+```bash
+llama-server -m EdgeRock-4B-Q4_K_M.gguf --soft-prompt sp.gguf --jinja --chat-template-file ../edgerock/ref/chat_template.jinja
+```
+
+In the prompt cache the soft rows stand as placeholder tokens (the pad token), so `prompt_tokens` in the usage counts
+them; a slot that has to start over restores the saved prefix instead of processing them. Not with media input or a
+draft model. The thinking is not split off into `reasoning_content` with this template.
+
 ### make_data.py, slice_model.py
 
 ```bash

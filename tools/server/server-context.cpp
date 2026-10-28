@@ -9,6 +9,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-soft-prompt.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -1067,6 +1068,9 @@ private:
 
     server_batch batch;
 
+    // --soft-prompt: the prefix in front of every prompt
+    server_soft_prompt soft_prompt;
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1448,6 +1452,21 @@ private:
                 SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n",
                         n_ctx_capped, n_ctx_train);
             }
+        }
+
+        if (!params_base.soft_prompt.empty()) {
+            if (mctx != nullptr || ctx_dft != nullptr) {
+                SRV_ERR("%s", "--soft-prompt does not support multimodal models or a draft model\n");
+                return false;
+            }
+            try {
+                soft_prompt.init(ctx_tgt, params_base.soft_prompt);
+            } catch (const std::exception & e) {
+                SRV_ERR("%s\n", e.what());
+                return false;
+            }
+            SRV_INF("soft prompt '%s': a prefix of %zu tokens, state %.1f MiB\n", params_base.soft_prompt.c_str(),
+                    soft_prompt.tokens.size(), soft_prompt.state.size() / 1024.0 / 1024.0);
         }
 
         slots.clear();
@@ -1924,7 +1943,29 @@ private:
         return output;
     }
 
+    // puts the soft prompt in front of the prompt, as its placeholder tokens (once: deferred tasks come back)
+    bool add_soft_prompt(server_task & task) {
+        if (soft_prompt.empty() || task.tokens.empty() || soft_prompt.is_prefix_of(task.tokens.get_tokens())) {
+            return true;
+        }
+        if (task.tokens.has_mtmd) {
+            send_error(task, "--soft-prompt does not support media input", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        server_tokens toks(soft_prompt.tokens, false);
+        toks.push_back(task.tokens);
+        task.tokens = std::move(toks);
+        if (task.n_tokens_shared > 0) {
+            task.n_tokens_shared += (int) soft_prompt.tokens.size();
+        }
+        return true;
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (!add_soft_prompt(task)) {
+            return false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2970,6 +3011,10 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    if (!add_soft_prompt(task)) {
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -4203,6 +4248,22 @@ private:
                                     }
                                 }
                             }
+                        }
+
+                        // the soft prompt prefix is not in the cache: restore its state instead of processing the placeholders
+                        if (!soft_prompt.empty() && n_past < (int) soft_prompt.tokens.size() &&
+                                slot.task->n_tokens() > (int) soft_prompt.tokens.size() &&
+                                soft_prompt.is_prefix_of(input_tokens.get_tokens())) {
+                            if (!soft_prompt.restore(ctx_tgt, slot.id)) {
+                                GGML_ABORT("failed to restore the soft prompt state\n");
+                            }
+                            slot.prompt.tokens.clear();
+                            for (llama_token t : soft_prompt.tokens) {
+                                slot.prompt.tokens.push_back(t);
+                            }
+                            slot.prompt.checkpoints.clear();
+                            n_past = (int) soft_prompt.tokens.size();
+                            SLT_TRC(slot, "restored the soft prompt prefix (%d tokens)\n", n_past);
                         }
 
                         // [TAG_PROMPT_LOGITS]

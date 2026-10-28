@@ -3666,6 +3666,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
     add_opt(common_arg(
+        {"--soft-prompt"}, "FNAME",
+        "soft prompt file (examples/soft-prompt, optionally with a tuned recurrent state) in front of every prompt; "
+        "it replaces the system turn, so requests should not have one (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.soft_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SOFT_PROMPT"));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {
