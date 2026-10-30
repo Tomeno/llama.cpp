@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--examples", type=int, default=8, help="examples per pair and step")
     ap.add_argument("--val-prompts", help="prompts (JSONL) sampled at every evaluation; selects the best checkpoint by reward")
     ap.add_argument("--n-val-prompts", type=int, default=0, help="validation prompts sampled, 0 = all")
+    ap.add_argument("--keep-evals", action="store_true", help="also save the state of every evaluation (OUT.stepN)")
     ap.add_argument("--forks", help="DPO pairs (JSONL) whose chosen and rejected responses share a prefix")
     ap.add_argument("--fork-examples", type=int, default=8, help="fork pairs per member and step")
     ap.add_argument("--beta", type=float, default=0.1)
@@ -190,6 +191,8 @@ def main():
                 best = score
                 save(args.out, es.theta, meta)
             save(args.out + ".last", es.theta, meta)
+            if args.keep_evals:
+                save(f"{args.out}.step{step}", es.theta, meta)
             print(f"step {step:5d}: val {vl:.5f}, score {score:.5f} (best {best:.5f})", file=sys.stderr)
 
 
