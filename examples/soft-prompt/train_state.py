@@ -20,6 +20,7 @@ of the model, before the first token of the prompt; s0 is zero then, so the scal
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
@@ -118,6 +119,9 @@ def main():
         ids = [i for i in range(len(vp)) for _ in range(args.group)]
         samples = rollout.rollout(eng, theta, vp, ids, args.gen_max, cfg, sampling, args.seed + 7, args.reward_cmd, st[0])
         print(f"step {step:5d}: val sampled {rollout.summary(samples)}", file=sys.stderr)
+        if args.samples_out:  # appended at every evaluation, tagged with the step
+            with open(args.samples_out, "a") as f:
+                f.writelines(json.dumps({"step": step, **rollout.sample_row(s, vp)}, ensure_ascii=False) + "\n" for s in samples)
         return -float(np.mean([s["reward"] for s in samples])), vl
 
     def save(path: str, z, meta: dict):
