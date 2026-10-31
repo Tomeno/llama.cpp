@@ -5850,9 +5850,10 @@ struct test_out_prod : public test_case {
     const std::array<int64_t, 2> bs; // dims 3 and 4
     const std::array<int64_t, 2> nr; // repeat in dims 3 and 4
     const bool trans_b;
+    const bool view_a; // a is a view of every other row of a larger tensor (strided, as a slice of a memory bank)
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, m, n, k, bs, nr, trans_b);
+        return VARS_TO_STR9(type_a, type_b, m, n, k, bs, nr, trans_b, view_a);
     }
 
     double max_nmse_err() override {
@@ -5863,11 +5864,17 @@ struct test_out_prod : public test_case {
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
-            bool trans_b = false)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), trans_b(trans_b) {}
+            bool trans_b = false, bool view_a = false)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), trans_b(trans_b), view_a(view_a) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, m, k, bs[0], bs[1]);
+        ggml_tensor * a;
+        if (view_a) {
+            a = ggml_new_tensor_4d(ctx, type_a, m, 2*k, bs[0], bs[1]);
+            a = ggml_view_4d(ctx, a, m, k, bs[0], bs[1], 2*a->nb[1], a->nb[2], a->nb[3], a->nb[1]);
+        } else {
+            a = ggml_new_tensor_4d(ctx, type_a, m, k, bs[0], bs[1]);
+        }
         ggml_set_name(a, "a");
 
         ggml_tensor * b;
@@ -11485,6 +11492,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nr2 : {8, 16, 32}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
+    }
+
+    // transposed b and strided a (EdgeRock's memory read-out: out_prod(V bank view, transpose(attention weights)))
+    for (bool view_a : {false, true}) {
+        for (int n : {1, 4, 16}) {
+            test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 256, n, 16, {1, 1}, {1, 1}, true, view_a));
+            test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 256, n, 1280, {4, 1}, {1, 1}, true, view_a));
+        }
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 256, 16, 16, {3, 2}, {2, 1}, false, view_a));
     }
 
     // add_id
