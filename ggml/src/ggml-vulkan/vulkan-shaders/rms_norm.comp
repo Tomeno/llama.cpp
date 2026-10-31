@@ -39,11 +39,14 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
-#define BLOCK_SIZE 512
 
 layout (constant_id = 1) const bool do_multiply = false;
 #if RMS_NORM_ADD_FUSION
 layout (constant_id = 2) const bool do_post_multiply = false;
+#endif
+// threads per row (one row per workgroup): 512, or 128 (rms_norm_small) for short rows such as per-head norms
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 512
 #endif
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
