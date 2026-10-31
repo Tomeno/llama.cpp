@@ -1,0 +1,98 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
+    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
+    uint misalign_offsets;
+    float param1; float param2; int param3;
+} p;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFF; }
+uint get_doffset() { return p.misalign_offsets & 0xFF; }
+
+// out_prod for a narrow dst (few columns, e.g. the attention weights of one token): dst[i0, i1] = sum_k a[i0, k] * b[i1, k].
+// A workgroup takes BM rows of dst and up to BN of its columns; its KS lanes per row split K, each reads a once per k
+// (consecutive threads on consecutive rows) with UNROLL loads in flight, and the partial sums are reduced in shared
+// memory. The reads are latency bound: many small workgroups and independent loads keep enough of them in flight.
+#define BM 16
+#define KS 16
+#define BN 8
+#define UNROLL 4
+
+layout(local_size_x = BM * KS, local_size_y = 1, local_size_z = 1) in;
+
+shared float red[KS][BN][BM];
+
+void main() {
+    const uint tm = gl_LocalInvocationID.x % BM;
+    const uint ks = gl_LocalInvocationID.x / BM;
+
+    const uint gm = gl_WorkGroupID.x * BM + tm;
+    const uint n0 = gl_WorkGroupID.y * BN;
+    const uint i2 = gl_WorkGroupID.z % p.ne22;
+    const uint i3 = gl_WorkGroupID.z / p.ne22;
+    const uint nn = min(BN, p.ne21 - n0);
+
+    const uint a_base = get_aoffset() + (i3 / (p.ne23 / p.ne03))*p.nb03 + (i2 / (p.ne22 / p.ne02))*p.nb02 + gm*p.nb00;
+    const uint b_base = get_boffset() + i3*p.nb13 + i2*p.nb12;
+
+    float acc[BN];
+    [[unroll]] for (uint c = 0; c < BN; c++) {
+        acc[c] = 0.0f;
+    }
+
+    if (gm < p.ne20) {
+        uint k = ks;
+        for (; k + (UNROLL - 1)*KS < p.ne01; k += UNROLL*KS) {
+            float a[UNROLL];
+            [[unroll]] for (uint u = 0; u < UNROLL; u++) {
+                a[u] = data_a[a_base + (k + u*KS)*p.nb01];
+            }
+            [[unroll]] for (uint c = 0; c < BN; c++) {
+                if (c < nn) {
+                    const uint b_row = b_base + ((n0 + c) % p.ne10)*p.nb10;
+                    [[unroll]] for (uint u = 0; u < UNROLL; u++) {
+                        acc[c] = fma(a[u], data_b[b_row + (k + u*KS)*p.nb11], acc[c]);
+                    }
+                }
+            }
+        }
+        for (; k < p.ne01; k += KS) {
+            const float a = data_a[a_base + k*p.nb01];
+            [[unroll]] for (uint c = 0; c < BN; c++) {
+                if (c < nn) {
+                    acc[c] = fma(a, data_b[b_base + k*p.nb11 + ((n0 + c) % p.ne10)*p.nb10], acc[c]);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint c = 0; c < BN; c++) {
+        red[ks][c][tm] = acc[c];
+    }
+    barrier();
+
+    if (ks == 0 && gm < p.ne20) {
+        const uint d_base = get_doffset() + i3*p.nb23 + i2*p.nb22 + gm*p.nb20;
+        [[unroll]] for (uint c = 0; c < BN; c++) {
+            if (c < nn) {
+                float s = 0.0f;
+                [[unroll]] for (uint j = 0; j < KS; j++) {
+                    s += red[j][c][tm];
+                }
+                data_d[d_base + (n0 + c)*p.nb21] = s;
+            }
+        }
+    }
+}

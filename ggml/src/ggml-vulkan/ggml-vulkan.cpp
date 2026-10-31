@@ -3648,6 +3648,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // one workgroup per 64 x 64 tile of dst (out_prod.comp BM x BN)
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {64, 64, 1}, {}, 1);
+    // dst with few columns: 16 rows x 8 columns per workgroup, K split over its lanes (out_prod_narrow.comp)
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_narrow_f32, "out_prod_narrow_f32", out_prod_narrow_f32_len, out_prod_narrow_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {16, 8, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -8783,7 +8785,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_OUT_PROD:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_out_prod_f32;
+            return dst->ne[1] <= 8 ? ctx->device->pipeline_out_prod_narrow_f32 : ctx->device->pipeline_out_prod_f32;
         }
         return nullptr;
     case GGML_OP_CONCAT: {

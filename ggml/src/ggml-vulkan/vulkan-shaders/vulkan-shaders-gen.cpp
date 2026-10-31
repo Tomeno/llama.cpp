@@ -1131,6 +1131,7 @@ void process_shaders() {
     }
 
     string_to_spv("out_prod_f32", "out_prod.comp", {});
+    string_to_spv("out_prod_narrow_f32", "out_prod_narrow.comp", {});
 
     string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
