@@ -1,0 +1,19 @@
+{#- EdgeRock chat template: ref/chat_template.jinja (the upstream one) plus the reasoning of an assistant message after
+    the last user message, as <think>...</think>, so that llama-server finds the reasoning tags and returns the thinking
+    as reasoning_content. Conversations render as with the upstream template: earlier answers without their thinking. -#}
+{%- set ns = namespace(last_user=-1) %}
+{%- for message in messages %}
+{%- if message['role'] == 'user' %}
+{%- set ns.last_user = loop.index0 %}
+{%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+{%- if message['role'] == 'assistant' and loop.index0 > ns.last_user and message.reasoning_content is defined and message.reasoning_content %}
+{{- '<|im_start|>assistant\n<think>\n' + message.reasoning_content.strip() + '\n</think>\n' + message['content'] + '<|im_end|>\n' }}
+{%- else %}
+{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n' }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|im_start|>assistant\n<think>\n' }}
+{%- endif %}

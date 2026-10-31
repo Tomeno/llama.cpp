@@ -31,6 +31,9 @@ build/bin/llama-completion -m models/EdgeRock-4B-Q4_K_M.gguf -p "The capital of 
 # chat: the GGUF has no chat template; the official one is ChatML that opens <think> (fetch_reference.py downloads it)
 build/bin/llama-completion -m models/EdgeRock-4B-Q4_K_M.gguf --jinja --chat-template-file ref/chat_template.jinja \
     -cnv -st -p "What is 17*23?" --temp 0.6 --top-p 0.95 --top-k 20 -n 4096
+# server: examples/edgerock/chat_template.jinja prompts the same, but lets the server split the thinking into
+# reasoning_content (with the official template it stays in the content, up to a literal </think>)
+build/bin/llama-server -m models/EdgeRock-4B-Q4_K_M.gguf --jinja --chat-template-file examples/edgerock/chat_template.jinja
 ```
 
 Expected on CPU (Q4_K_M, 4 threads): "Paris. Paris is known for ...", ~4 tokens/s.
