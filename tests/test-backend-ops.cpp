@@ -5840,6 +5840,36 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+// GGML_OP_CONCAT along dim 0 with a transposed source (the conv input of delta-net layers: concat(conv states, transpose(qkv)))
+struct test_concat_transposed : public test_case {
+    const ggml_type type;
+    const int64_t ne_a0;
+    const int64_t ne_b0;
+    const int64_t n1;
+    const int64_t n2;
+    const bool trans_a; // transpose a instead of b
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, ne_a0, ne_b0, n1, n2, trans_a);
+    }
+
+    test_concat_transposed(ggml_type type = GGML_TYPE_F32, int64_t ne_a0 = 3, int64_t ne_b0 = 37, int64_t n1 = 100,
+            int64_t n2 = 2, bool trans_a = false)
+        : type(type), ne_a0(ne_a0), ne_b0(ne_b0), n1(n1), n2(n2), trans_a(trans_a) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = trans_a ? ggml_transpose(ctx, ggml_new_tensor_3d(ctx, type, n1, ne_a0, n2))
+                                  : ggml_new_tensor_3d(ctx, type, ne_a0, n1, n2);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = trans_a ? ggml_new_tensor_3d(ctx, type, ne_b0, n1, n2)
+                                  : ggml_transpose(ctx, ggml_new_tensor_3d(ctx, type, n1, ne_b0, n2));
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -11739,6 +11769,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_concat_transposed(type, 3, 37, 100, 2));
+        test_cases.emplace_back(new test_concat_transposed(type, 3, 515, 8192, 1));
+        test_cases.emplace_back(new test_concat_transposed(type, 37, 3, 64, 3, true));
+        test_cases.emplace_back(new test_concat_transposed(type, 1, 33, 31, 1));
     }
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {

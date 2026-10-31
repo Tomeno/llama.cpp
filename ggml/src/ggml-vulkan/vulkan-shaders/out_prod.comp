@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : enable
 
 layout (push_constant) uniform parameter
 {
@@ -16,44 +17,97 @@ layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) readonly buffer B {float data_b[];};
 layout (binding = 2) writeonly buffer D {float data_d[];};
 
-uint get_idx() {
-    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
-}
-
 uint get_aoffset() { return p.misalign_offsets >> 16; }
 uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFF; }
 uint get_doffset() { return p.misalign_offsets & 0xFF; }
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// dst[i0, i1] = sum_k a[i0, k] * b[i1, k] (k = dim 1 of a and b), per (i2, i3) slice with a broadcast over them.
+// One workgroup computes a BM x BN tile of dst, each thread TM x TN of its elements (strided by the thread grid, so
+// shared memory reads and global stores stay contiguous); K is walked in BK slices staged in shared memory, loaded
+// along whichever of k and the row index has the smaller stride (V as stored, a transposed b).
+#define BM 64
+#define BN 64
+#define BK 16
+#define TX 16
+#define TY 16
+#define TM (BM / TX)
+#define TN (BN / TY)
+#define NT (TX * TY)
+
+layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
+
+shared float sa[BK][BM + 1];
+shared float sb[BK][BN + 1];
 
 void main() {
-    uint idx = get_idx();
-    if (idx >= p.ne) {
-        return;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint tx  = tid % TX;
+    const uint ty  = tid / TX;
+
+    const uint m0 = gl_WorkGroupID.x * BM;
+    const uint n0 = gl_WorkGroupID.y * BN;
+    const uint i2 = gl_WorkGroupID.z % p.ne22;
+    const uint i3 = gl_WorkGroupID.z / p.ne22;
+
+    const uint a_base = get_aoffset() + (i3 / (p.ne23 / p.ne03))*p.nb03 + (i2 / (p.ne22 / p.ne02))*p.nb02;
+    const uint b_base = get_boffset() + i3*p.nb13 + i2*p.nb12;
+
+    const uint K = p.ne01;
+    const bool a_k_inner = p.nb01 < p.nb00;
+    const bool b_k_inner = p.nb11 < p.nb10;
+
+    float acc[TM][TN];
+    [[unroll]] for (uint r = 0; r < TM; r++) {
+        [[unroll]] for (uint c = 0; c < TN; c++) {
+            acc[r][c] = 0.0f;
+        }
     }
 
-    uint tmp = idx;
-    uint i0 = tmp % p.ne20; tmp /= p.ne20;
-    uint i1 = tmp % p.ne21; tmp /= p.ne21;
-    uint i2 = tmp % p.ne22; tmp /= p.ne22;
-    uint i3 = tmp;
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        [[unroll]] for (uint j = 0; j < (BK * BM) / NT; j++) {
+            const uint e  = tid + j*NT;
+            const uint kk = a_k_inner ? e % BK : e / BM;
+            const uint mm = a_k_inner ? e / BK : e % BM;
+            const uint gm = m0 + mm;
+            const uint gk = k0 + kk;
+            sa[kk][mm] = (gm < p.ne20 && gk < K) ? data_a[a_base + gk*p.nb01 + gm*p.nb00] : 0.0f;
+        }
+        [[unroll]] for (uint j = 0; j < (BK * BN) / NT; j++) {
+            const uint e  = tid + j*NT;
+            const uint kk = b_k_inner ? e % BK : e / BN;
+            const uint nn = b_k_inner ? e / BK : e % BN;
+            const uint gn = n0 + nn;
+            const uint gk = k0 + kk;
+            sb[kk][nn] = (gn < p.ne21 && gk < K) ? data_b[b_base + gk*p.nb11 + (gn % p.ne10)*p.nb10] : 0.0f;
+        }
+        barrier();
 
-    uint a_i0 = i0 % p.ne00;
-    uint a_i2 = i2 / (p.ne22 / p.ne02);
-    uint a_i3 = i3 / (p.ne23 / p.ne03);
-
-    uint b_i0 = i1 % p.ne10;
-    uint b_i2 = i2;
-    uint b_i3 = i3;
-
-    float sum = 0.0f;
-    uint K = p.ne01;
-    for (uint k = 0; k < K; k++) {
-        uint aoff = get_aoffset() + a_i3*p.nb03 + a_i2*p.nb02 + k*p.nb01 + a_i0*p.nb00;
-        uint boff = get_boffset() + b_i3*p.nb13 + b_i2*p.nb12 + k*p.nb11 + b_i0*p.nb10;
-        sum += data_a[aoff] * data_b[boff];
+        [[unroll]] for (uint kk = 0; kk < BK; kk++) {
+            float av[TM];
+            float bv[TN];
+            [[unroll]] for (uint r = 0; r < TM; r++) {
+                av[r] = sa[kk][tx + r*TX];
+            }
+            [[unroll]] for (uint c = 0; c < TN; c++) {
+                bv[c] = sb[kk][ty + c*TY];
+            }
+            [[unroll]] for (uint r = 0; r < TM; r++) {
+                [[unroll]] for (uint c = 0; c < TN; c++) {
+                    acc[r][c] = fma(av[r], bv[c], acc[r][c]);
+                }
+            }
+        }
+        barrier();
     }
 
-    uint doff = get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20;
-    data_d[doff] = sum;
+    const uint d_base = get_doffset() + i3*p.nb23 + i2*p.nb22;
+    [[unroll]] for (uint r = 0; r < TM; r++) {
+        const uint gm = m0 + tx + r*TX;
+        [[unroll]] for (uint c = 0; c < TN; c++) {
+            const uint gn = n0 + ty + c*TY;
+            if (gm < p.ne20 && gn < p.ne21) {
+                data_d[d_base + gn*p.nb21 + gm*p.nb20] = acc[r][c];
+            }
+        }
+    }
 }
