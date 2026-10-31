@@ -169,6 +169,19 @@ A file without a prefix (`train_state.py --no-soft-prompt`: no soft rows, no bef
 state; the server then gives every slot that starts from position 0 that state before the first prompt token
 (`llama_memory_seq_seed` + `llama_memory_seq_state_set`), and the prompt is the plain chat format without a system turn.
 
+### prefix_state.py
+
+```bash
+python prefix_state.py -m M.gguf --state state.gguf --system "You are Captain Bess Barnacle, ..." -o persona.gguf
+```
+
+A file with a system prompt as its text prefix and, as its state, the recurrent state that the initial state of
+`--state` reaches after reading that prompt (`sp_set_init_state`). Served with `--soft-prompt`, it behaves like the tuned
+state with that system prompt, and requests need no system message. A persona can't be tuned into the recurrent state
+alone: on EdgeRock the identity lives in the window KV of the prompt and in the state together (the state left by the
+persona prompt, without its KV, plays no persona; the persona prompt with the state swapped for another one plays it
+weakly).
+
 ### make_data.py, slice_model.py
 
 ```bash
