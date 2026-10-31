@@ -50,6 +50,7 @@ struct sp_ctx {
     int32_t n_threads   = 1;
 
     std::vector<llama_token> before;
+    std::vector<float>       init; // recurrent state before the prefix (empty: zero)
 
     std::vector<std::pair<int32_t, int64_t>> state_layers; // (layer, floats) of the recurrent states
     int64_t n_state = 0;
@@ -219,6 +220,15 @@ static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, con
         }
     }
     const int nu = (int) seqs.size();
+
+    if (!c->init.empty() && (!c->before.empty() || n_soft > 0)) {
+        for (llama_seq_id s : seqs) {
+            if (!llama_memory_seq_seed(c->ctx, s)) {
+                throw std::runtime_error("failed to seed sequence " + std::to_string(s));
+            }
+            set_state(c, s, c->init.data());
+        }
+    }
 
     llama_pos pos = 0;
     for (int i = 0; i < (int) c->before.size(); i += chunk(c, nu)) {
@@ -469,6 +479,15 @@ SP_API int32_t sp_detokenize(const sp_ctx * c, const int32_t * toks, int32_t n, 
 // the fixed tokens before the soft prompt
 SP_API void sp_set_before(sp_ctx * c, const int32_t * toks, int32_t n) {
     c->before.assign(toks, toks + n);
+}
+
+// the recurrent state [n_state] the prefix starts from, nullptr = zero (the default)
+SP_API void sp_set_init_state(sp_ctx * c, const float * state) {
+    if (state) {
+        c->init.assign(state, state + c->n_state);
+    } else {
+        c->init.clear();
+    }
 }
 
 // rows of token_embd.weight for the ids, dequantized, read from the model file: out [n][n_embd]

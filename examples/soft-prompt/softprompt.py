@@ -58,6 +58,7 @@ def _load_lib(path: str) -> ctypes.CDLL:
     lib.sp_tokenize.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, _i32p, ctypes.c_int32]
     lib.sp_detokenize.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32]
     lib.sp_set_before.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32]
+    lib.sp_set_init_state.argtypes = [ctypes.c_void_p, _f32p]
     lib.sp_token_embeddings.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32, _f32p]
     lib.sp_score.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, _i32p, ctypes.c_int32,
                              _i32p, _i64p, _i32p, _i32p, _i64p, _i32p, ctypes.c_float, _f32p]
@@ -146,6 +147,11 @@ class Engine:
     def set_before(self, toks: Sequence[int]):
         t = np.ascontiguousarray(toks, dtype=np.int32)
         self.lib.sp_set_before(self.ctx, _ptr(t, _i32p), len(t))
+
+    def set_init_state(self, state: np.ndarray | None):
+        """The recurrent state [n_state] the prefix starts from (None: zero)."""
+        self._init = None if state is None else np.ascontiguousarray(state, dtype=np.float32)
+        self.lib.sp_set_init_state(self.ctx, _opt(self._init) if self._init is not None else None)
 
     def token_embeddings(self, ids: Sequence[int]) -> np.ndarray:
         t = np.ascontiguousarray(ids, dtype=np.int32)

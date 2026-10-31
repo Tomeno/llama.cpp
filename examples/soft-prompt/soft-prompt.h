@@ -25,6 +25,7 @@ int32_t sp_tokenize  (const sp_ctx * c, const char * text, int32_t len, int32_t 
 int32_t sp_detokenize(const sp_ctx * c, const int32_t * toks, int32_t n, char * out, int32_t cap);
 
 void    sp_set_before      (sp_ctx * c, const int32_t * toks, int32_t n);
+void    sp_set_init_state  (sp_ctx * c, const float * state);
 int32_t sp_token_embeddings(const sp_ctx * c, const int32_t * ids, int32_t n, float * out);
 int32_t sp_get_state       (sp_ctx * c, const float * theta, int32_t n_soft, float * out);
 
