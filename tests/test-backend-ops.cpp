@@ -3503,8 +3503,9 @@ struct test_bin_bcast : public test_case {
             ggml_set_name(b[i], (std::string("b") + std::to_string(i)).c_str());
         }
 
-        // The backward pass supports broadcasting only for GGML_ADD:
-        const bool grad_supported = op == ggml_add && ggml_are_same_shape(a, b[0]) && nf == 1 && !perm1;
+        // DIV with a broadcast b: the finite differences of the summed output are lost in rounding
+        const bool grad_supported = (op == ggml_add || op == ggml_sub || op == ggml_mul || (op == ggml_div && ggml_are_same_shape(a, b[0]))) &&
+            nf == 1 && !perm1 && !src_overlap;
         if (grad_supported) {
             ggml_set_param(a);
             ggml_set_param(b[0]);
@@ -5903,21 +5904,36 @@ struct test_out_prod : public test_case {
         : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), trans_b(trans_b), view_a(view_a) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the backward pass has no broadcast of a; with a non-F32 a, the gradient of b goes through a mul_mat that rounds it
+        const bool grad = nr[0] == 1 && nr[1] == 1 && type_a == GGML_TYPE_F32;
+
         ggml_tensor * a;
         if (view_a) {
             a = ggml_new_tensor_4d(ctx, type_a, m, 2*k, bs[0], bs[1]);
+            if (grad) {
+                ggml_set_param(a);
+            }
             a = ggml_view_4d(ctx, a, m, k, bs[0], bs[1], 2*a->nb[1], a->nb[2], a->nb[3], a->nb[1]);
         } else {
             a = ggml_new_tensor_4d(ctx, type_a, m, k, bs[0], bs[1]);
+            if (grad) {
+                ggml_set_param(a);
+            }
         }
         ggml_set_name(a, "a");
 
         ggml_tensor * b;
         if (trans_b) {
             b = ggml_new_tensor_4d(ctx, type_b, k, n, bs[0]*nr[0], bs[1]*nr[1]);
+            if (grad && type_b == GGML_TYPE_F32) {
+                ggml_set_param(b);
+            }
             b = ggml_transpose(ctx, b);
         } else {
             b = ggml_new_tensor_4d(ctx, type_b, n, k, bs[0]*nr[0], bs[1]*nr[1]);
+            if (grad && type_b == GGML_TYPE_F32) {
+                ggml_set_param(b);
+            }
         }
         ggml_set_name(b, "b");
 

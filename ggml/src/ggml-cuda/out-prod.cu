@@ -59,10 +59,11 @@ static void out_prod_dequant(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
+    // the stride of a dimension of size 1 is arbitrary, cuBLAS wants at least the number of rows
+    const int64_t           ldb            = std::max<int64_t>((src1_T ? nb10 : nb11) / sizeof(float), src1_T ? ne11 : ne10);
     GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
 
-    const int64_t ldc = nb1 / sizeof(float);
+    const int64_t ldc = std::max<int64_t>(nb1 / sizeof(float), ne0);
 
     const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(ne01, (int64_t(64) << 20) / ne00));
     ggml_cuda_pool_alloc<float> src0_f32(ctx.pool(), rows*ne00);
@@ -118,12 +119,13 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    const int64_t lda = nb01 / sizeof(float);
-    const int64_t ldc = nb1  / sizeof(float);
+    const int64_t lda = std::max<int64_t>(nb01 / sizeof(float), ne00);
+    const int64_t ldc = std::max<int64_t>(nb1  / sizeof(float), ne0);
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
+    // the stride of a dimension of size 1 is arbitrary, cuBLAS wants at least the number of rows
+    const int64_t           ldb            = std::max<int64_t>((src1_T ? nb10 : nb11) / sizeof(float), src1_T ? ne11 : ne10);
     GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
 
     // data strides in dimensions 2/3
