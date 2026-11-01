@@ -7256,6 +7256,20 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sigmoid(ctx, src0)));
                     }
                 } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    if (src0_needs_grads) {
+                        // y (1 - y)
+                        struct ggml_tensor * dy = ggml_mul(ctx, tensor, ggml_scale_bias(ctx, tensor, -1.0f, 1.0f));
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, dy));
+                    }
+                } break;
+                case GGML_UNARY_OP_TANH: {
+                    if (src0_needs_grads) {
+                        // 1 - y^2
+                        struct ggml_tensor * dy = ggml_scale_bias(ctx, ggml_sqr(ctx, tensor), -1.0f, 1.0f);
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, dy));
+                    }
+                } break;
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
@@ -7284,6 +7298,79 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        case GGML_OP_CONCAT: {
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], grad->nb[1], grad->nb[2], grad->nb[3], 0)));
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, ggml_view_4d(ctx, grad,
+                    src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], grad->nb[1], grad->nb[2], grad->nb[3],
+                    src0->ne[dim]*grad->nb[dim])));
+            }
+        } break;
+        case GGML_OP_PAD: {
+            if (src0_needs_grads) {
+                GGML_ASSERT(ggml_get_op_params_i32(tensor, 8) == 0 && "backward pass for circular padding not implemented");
+                size_t offset = 0;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    offset += ggml_get_op_params_i32(tensor, 2*d)*grad->nb[d];
+                }
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, ggml_view_4d(ctx, grad,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], grad->nb[1], grad->nb[2], grad->nb[3], offset)));
+            }
+        } break;
+        case GGML_OP_CUMSUM: {
+            if (src0_needs_grads) {
+                // suffix sums of the gradient: sum - cumsum + grad
+                struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_add(ctx, ggml_sub(ctx, g, ggml_cumsum(ctx, g)), ggml_sum_rows(ctx, g)));
+            }
+        } break;
+        case GGML_OP_TRI: {
+            if (src0_needs_grads) {
+                struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, g, (enum ggml_tri_type) ggml_get_op_params_i32(tensor, 0)));
+            }
+        } break;
+        case GGML_OP_SOLVE_TRI: {
+            // X = A^-1 B: dB = A^-T dX, dA = -tril(dB X^T)
+            const int64_t n = src0->ne[0];
+            struct ggml_tensor * ones = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n, 1, src0->ne[2], src0->ne[3]), 1.0f);
+            struct ggml_tensor * a_inv = ggml_solve_tri(ctx, src0, ggml_diag(ctx, ones), true, true, false);
+            struct ggml_tensor * db = ggml_mul_mat(ctx,
+                ggml_cont(ctx, ggml_transpose(ctx, grad)), ggml_cont(ctx, ggml_transpose(ctx, a_inv)));
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, ggml_neg(ctx, ggml_mul_mat(ctx, tensor, db)), GGML_TRI_TYPE_LOWER_DIAG));
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, db);
+            }
+        } break;
+        case GGML_OP_DIAG: {
+            if (src0_needs_grads) {
+                const int64_t n = src0->ne[0];
+                struct ggml_tensor * d = ggml_view_4d(ctx, grad, 1, n, grad->ne[2], grad->ne[3],
+                    grad->nb[1] + grad->nb[0], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape_4d(ctx, ggml_cont(ctx, d), n, 1, grad->ne[2], grad->ne[3]));
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            // the transposed convolution: the gradient padded by d_conv - 1 on both sides, convolved with the flipped kernel
+            if (src0_needs_grads) {
+                const int64_t d_conv = src1->ne[0];
+                struct ggml_tensor * g = ggml_pad_ext(ctx, ggml_cont(ctx, ggml_transpose(ctx, grad)),
+                    d_conv - 1, d_conv - 1, 0, 0, 0, 0, 0, 0);
+                struct ggml_tensor * c_flip = NULL;
+                for (int64_t j = d_conv - 1; j >= 0; --j) {
+                    struct ggml_tensor * col = ggml_cont(ctx, ggml_view_2d(ctx, src1, 1, src1->ne[1], src1->nb[1], j*src1->nb[0]));
+                    c_flip = c_flip ? ggml_concat(ctx, c_flip, col, 0) : col;
+                }
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, ggml_transpose(ctx, ggml_ssm_conv(ctx, g, c_flip))));
+            }
+            GGML_ASSERT(!src1_needs_grads && "backward pass for the ssm_conv kernel not implemented");
         } break;
         case GGML_OP_NONE: {
             // noop
@@ -7447,6 +7534,7 @@ void ggml_build_backward_expand(
             // gradients in node->src[0] for one reason or another have no effect on output gradients
             case GGML_OP_IM2COL:      // only used for its shape
             case GGML_OP_IM2COL_BACK: // same as IM2COL
+            case GGML_OP_FILL:        // same as IM2COL
                 ignore_src[0] = true;
                 break;
             case GGML_OP_UNARY: {

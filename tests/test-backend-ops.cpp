@@ -2087,7 +2087,7 @@ struct test_unary : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
             op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
-            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
+            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS || op == GGML_UNARY_OP_SIGMOID || op == GGML_UNARY_OP_TANH;
 
         ggml_tensor * a;
         if (v & 1) {
@@ -4676,9 +4676,14 @@ struct test_ssm_conv : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_set_param(a);
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
+    }
+    // linear in a: a large step keeps the finite differences above the rounding of the sum
+    float grad_eps() override {
+        return 1.0f;
     }
 };
 
@@ -7141,6 +7146,7 @@ struct test_concat : public test_case {
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 2; ne[1] *= 4; ne[2] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(a);
             ggml_set_name(a, "a");
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
@@ -7148,18 +7154,21 @@ struct test_concat : public test_case {
         } else if (v & 4) {
             auto ne = ne_a; ne[2] *= 2; ne[3] *= 4;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(a);
             ggml_set_name(a, "a");
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(a);
             ggml_set_name(a, "a");
         }
         ggml_tensor * b;
         if (v & 2) {
             auto ne = ne_b; ne[0] *= 3; ne[1] *= 2; ne[2] *= 4;
             b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(b);
             ggml_set_name(b, "b");
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
@@ -7167,12 +7176,14 @@ struct test_concat : public test_case {
         } else if (v & 8) {
             auto ne = ne_b; ne[2] *= 3; ne[3] *= 2;
             b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(b);
             ggml_set_name(b, "b");
 
             b = ggml_view_4d(ctx, b, ne_b[0], ne_b[1], ne_b[2], ne_b[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(b, "view_of_b");
         } else {
             b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+            ggml_set_param(b);
             ggml_set_name(b, "b");
         }
 
@@ -8395,6 +8406,9 @@ struct test_pad : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        if (!circular) {
+            ggml_set_param(a);
+        }
         ggml_set_name(a, "a");
 
         ggml_tensor * out = circular
@@ -9068,9 +9082,21 @@ struct test_solve_tri : public test_case {
         return out;
     }
 
+    bool grad_precise() override {
+        return true;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "a") == 0) {
+            if (strcmp(t->name, "a") == 0 && mode == MODE_GRAD) {
+                // well conditioned (I + small lower), so that finite differences are not lost in rounding
+                init_tensor_tril(t, -0.2f, 0.2f);
+                std::vector<float> d = tensor_to_float(t);
+                for (int64_t i = 0; i < ggml_nrows(t); i++) {
+                    d[i*t->ne[0] + i % t->ne[0]] += 1.0f;
+                }
+                ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "a") == 0) {
                 // note: avoid zeros in the diagonal
                 init_tensor_tril(t, 0.1, 1.0f);
             } else {
