@@ -1096,6 +1096,10 @@ void llama_context::set_state_grad(bool on) {
     cparams.state_grad = on;
 }
 
+void llama_context::set_state_grad_ckpt(int32_t n_layers) {
+    cparams.state_grad_ckpt = std::max(0, n_layers);
+}
+
 void llama_context::set_state_grad_weights(const float * w, int32_t n) {
     lp_weights_batch.assign(w, w + n);
 }
@@ -1668,18 +1672,76 @@ llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatc
     gf_res_prev_active = nullptr;
     if (!gf_res_grad || gf_res_grad->get_max_nodes() < (int64_t) max_nodes) {
         gf_res_grad.reset(new llm_graph_result(max_nodes));
-    } else {
-        gf_res_grad->reset();
     }
+
+    // gradient checkpointing: the layers in segments; a forward pass keeps the hidden states at the segment starts,
+    // then every segment is recomputed from its start and backpropagated, the last one first
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    const int32_t n_seg_layers = cparams.state_grad_ckpt > 0 ? cparams.state_grad_ckpt : n_layer;
+    std::vector<int32_t> bounds;
+    for (int32_t il = 0; il < n_layer; il += n_seg_layers) {
+        bounds.push_back(il);
+    }
+    bounds.push_back(n_layer);
+    const int n_seg = (int) bounds.size() - 1;
+
+    std::vector<std::vector<float>> h(n_seg); // hidden state at the start of segment k (k > 0)
+    for (int k = 0; k + 1 < n_seg; ++k) {
+        llm_graph_grad_seg seg;
+        seg.il0      = bounds[k];
+        seg.il1      = bounds[k + 1];
+        seg.fwd_only = true;
+        seg.inp      = k > 0 ? &h[k] : nullptr;
+        ret = grad_pass(ubatch, gtype, mctx, n_seg > 1 ? &seg : nullptr, &h[k + 1], nullptr);
+        if (ret != GGML_STATUS_SUCCESS) {
+            return nullptr;
+        }
+    }
+
+    state_grads.clear();
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        state_grads[ubatch.seq_id[s*ubatch.n_seq_tokens][0]].resize(n_layer);
+    }
+
+    std::vector<float> g;      // gradient of the hidden state at the end of the current segment
+    std::vector<float> g_prev; // ... at its start
+    for (int k = n_seg - 1; k >= 0; --k) {
+        llm_graph_grad_seg seg;
+        seg.il0  = bounds[k];
+        seg.il1  = bounds[k + 1];
+        seg.inp  = k > 0 ? &h[k] : nullptr;
+        seg.grad = k < n_seg - 1 ? &g : nullptr;
+        ret = grad_pass(ubatch, gtype, mctx, n_seg > 1 ? &seg : nullptr, nullptr, k > 0 ? &g_prev : nullptr);
+        if (ret != GGML_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        std::swap(g, g_prev);
+    }
+
+    // the log-probs were copied out by the pass of the last segment
     auto * res = gf_res_grad.get();
+    res->t_logprobs = nullptr;
+    res->t_logits   = nullptr;
+
+    return res;
+}
+
+ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
+        const llm_graph_grad_seg * seg, std::vector<float> * out, std::vector<float> * g_inp) {
+    auto * res = gf_res_grad.get();
+    res->reset();
 
     ggml_backend_sched_reset(sched.get());
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+    grad_seg_cur = seg;
     ggml_cgraph * gf = model.build_graph(graph_params(res, ubatch, mctx, gtype));
-    if (!gf || !res->t_loss) {
+    grad_seg_cur = nullptr;
+
+    const bool fwd_only = seg && seg->fwd_only;
+    if (!gf || (!fwd_only && !res->t_loss)) {
         LLAMA_LOG_ERROR("%s: failed to build the graph (the model needs a state-gradient mode)\n", __func__);
-        return nullptr;
+        return GGML_STATUS_FAILED;
     }
 
     const int n_nodes = ggml_graph_n_nodes(gf);
@@ -1694,25 +1756,12 @@ llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatc
     }
     ggml_context * ctx = ctx_grad.get();
 
-    // the gradient of the loss is 1
-    std::vector<ggml_tensor *> grad_accs(n_nodes, nullptr);
-    ggml_tensor * seed = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_set_input(seed);
-    for (int i = 0; i < n_nodes; ++i) {
-        if (ggml_graph_node(gf, i) == res->t_loss) {
-            grad_accs[i] = seed;
-        }
-    }
-
-    ggml_cgraph * gb = ggml_graph_dup(ctx, gf, /*force_grads =*/ true);
-    ggml_build_backward_expand(ctx, gb, grad_accs.data());
-
+    ggml_cgraph * gb   = gf;
+    ggml_tensor * seed = nullptr;
     std::vector<ggml_tensor *> grads(res->t_state_param.size(), nullptr);
-    for (size_t il = 0; il < grads.size(); ++il) {
-        ggml_tensor * p = res->t_state_param[il];
-        if (!p) {
-            continue;
-        }
+    ggml_tensor * g_seg_inp = nullptr;
+
+    auto grad_of = [&](ggml_tensor * p) {
         ggml_tensor * g = ggml_graph_get_grad(gb, p);
         if (g) {
             if (!ggml_is_contiguous(g)) {
@@ -1721,16 +1770,49 @@ llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatc
             }
             ggml_set_output(g);
         }
-        grads[il] = g;
-    }
-    ggml_set_output(res->t_logprobs);
+        return g;
+    };
 
-    LLAMA_LOG_DEBUG("%s: %d forward nodes, %d with the backward pass\n", __func__, n_nodes, ggml_graph_n_nodes(gb));
+    if (!fwd_only) {
+        // the gradient of the loss is 1
+        std::vector<ggml_tensor *> grad_accs(n_nodes, nullptr);
+        seed = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_input(seed);
+        for (int i = 0; i < n_nodes; ++i) {
+            if (ggml_graph_node(gf, i) == res->t_loss) {
+                grad_accs[i] = seed;
+            }
+        }
+
+        gb = ggml_graph_dup(ctx, gf, /*force_grads =*/ true);
+        ggml_build_backward_expand(ctx, gb, grad_accs.data());
+
+        for (size_t il = 0; il < grads.size(); ++il) {
+            if (res->t_state_param[il]) {
+                grads[il] = grad_of(res->t_state_param[il]);
+            }
+        }
+        if (g_inp && res->t_seg_inp) {
+            g_seg_inp = grad_of(res->t_seg_inp);
+        }
+    }
+    if (res->t_logprobs) {
+        ggml_set_output(res->t_logprobs);
+    }
+
+    // inputs the segment does not use (e.g. the tokens after the first one) are allocated anyway, so that they can be set
+    for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t; t = ggml_get_next_tensor(res->get_ctx(), t)) {
+        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+            ggml_build_forward_expand(gb, t);
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: layers %d .. %d%s: %d forward nodes, %d in all\n", __func__, seg ? seg->il0 : 0,
+            seg ? seg->il1 : (int) model.hparams.n_layer(), fwd_only ? " (forward)" : "", n_nodes, ggml_graph_n_nodes(gb));
 
     if (!ggml_backend_sched_alloc_graph(sched.get(), gb)) {
         LLAMA_LOG_ERROR("%s: failed to allocate the graph\n", __func__);
-        ret = GGML_STATUS_ALLOC_FAILED;
-        return nullptr;
+        return GGML_STATUS_ALLOC_FAILED;
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1739,23 +1821,40 @@ llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatc
     }
 
     res->set_inputs(&ubatch);
-    const float one = 1.0f;
-    ggml_backend_tensor_set(seed, &one, 0, sizeof(float));
+    if (seed) {
+        const float one = 1.0f;
+        ggml_backend_tensor_set(seed, &one, 0, sizeof(float));
+    }
 
     const auto status = graph_compute(gb, true);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-        ret = status;
-        return nullptr;
+        return status;
     }
 
     // the graph runs asynchronously
     ggml_backend_sched_synchronize(sched.get());
 
-    state_grads.clear();
-    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+    auto get = [](ggml_tensor * t, std::vector<float> & dst) {
+        dst.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+    };
+    if (out) {
+        get(res->t_seg_out, *out);
+    }
+    if (g_inp) {
+        if (g_seg_inp) {
+            get(g_seg_inp, *g_inp);
+        } else {
+            g_inp->assign(ggml_nelements(res->t_seg_inp), 0.0f);
+        }
+    }
+    if (res->t_logprobs) {
+        get(res->t_logprobs, lp_grad);
+    }
+
+    for (uint32_t s = 0; s < ubatch.n_seqs && !fwd_only; ++s) {
         auto & dst = state_grads[ubatch.seq_id[s*ubatch.n_seq_tokens][0]];
-        dst.resize(grads.size());
         for (size_t il = 0; il < grads.size(); ++il) {
             ggml_tensor * p = res->t_state_param[il];
             if (!p) {
@@ -1768,9 +1867,7 @@ llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatc
         }
     }
 
-    ret = GGML_STATUS_SUCCESS;
-
-    return res;
+    return GGML_STATUS_SUCCESS;
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
@@ -2258,6 +2355,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_t backend_lp = ggml_backend_sched_get_tensor_backend(sched.get(), t_logprobs);
             GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) lp_out.size());
             ggml_backend_tensor_get_async(backend_lp, t_logprobs, lp_out.data() + n_outputs_prev, 0, n_outputs*sizeof(float));
+        } else if (cparams.state_grad && n_outputs > 0) {
+            // the state-gradient mode copied them out already
+            GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) lp_out.size() && (int64_t) lp_grad.size() == n_outputs);
+            std::copy(lp_grad.begin(), lp_grad.end(), lp_out.begin() + n_outputs_prev);
         }
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
 
@@ -2935,6 +3036,7 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.lp_targets  =*/ &lp_targets_ub,
         /*.lp_weights  =*/ &lp_weights_ub,
+        /*.grad_seg    =*/ grad_seg_cur,
     };
 }
 
@@ -4621,6 +4723,10 @@ void llama_set_logprob_targets(llama_context * ctx, const llama_token * targets,
 
 void llama_set_state_grad(llama_context * ctx, bool on) {
     ctx->set_state_grad(on);
+}
+
+void llama_set_state_grad_ckpt(llama_context * ctx, int32_t n_layers) {
+    ctx->set_state_grad_ckpt(n_layers);
 }
 
 void llama_set_state_grad_weights(llama_context * ctx, const float * w, int32_t n_tokens) {

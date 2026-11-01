@@ -484,7 +484,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (cparams.state_grad) {
+        // the cache is not written: a later pass (gradient checkpointing) must read the same states
+    } else if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 

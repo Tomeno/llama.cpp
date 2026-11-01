@@ -1403,6 +1403,8 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_logprobs    = nullptr;
     t_loss        = nullptr;
+    t_seg_inp     = nullptr;
+    t_seg_out     = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1587,6 +1589,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     lp_targets       (params.lp_targets),
     lp_weights       (params.lp_weights),
+    grad_seg         (params.grad_seg),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

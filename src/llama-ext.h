@@ -160,6 +160,9 @@ LLAMA_API float llama_get_logprob_ith    (struct llama_context * ctx, int32_t i)
 // must start at position 0 and the batch must fit in one ubatch. The memory of the sequences is not written: remove
 // them after the decode.
 LLAMA_API void    llama_set_state_grad        (struct llama_context * ctx, bool on);
+// gradient checkpointing: the backward pass in segments of n_layers layers, each recomputed from the hidden state at its
+// start (kept by a forward pass): less memory (about one segment of activations), one more forward pass; 0: off
+LLAMA_API void    llama_set_state_grad_ckpt   (struct llama_context * ctx, int32_t n_layers);
 LLAMA_API void    llama_set_state_grad_weights(struct llama_context * ctx, const float * w, int32_t n_tokens);
 // the gradient of layer il of seq_id from the last decode; returns its size in floats (0: no state on that layer, dst ==
 // nullptr: query only), -1 if the last decode had no such sequence or layer

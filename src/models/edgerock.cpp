@@ -107,6 +107,22 @@ public:
     ggml_tensor * mask = nullptr; // F32 [n_tokens (keys), n_tokens (queries)]
 };
 
+// state_grad segment: a [n_embd, n_tokens] tensor from host data (the input hidden state, or the gradient of the output)
+class llm_graph_input_seg_host : public llm_graph_input_i {
+public:
+    llm_graph_input_seg_host(const std::vector<float> * data) : data(data) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(data && data->size() == (size_t) ggml_nelements(t));
+        ggml_backend_tensor_set(t, data->data(), 0, ggml_nbytes(t));
+    }
+
+    const std::vector<float> * data;
+
+    ggml_tensor * t = nullptr;
+};
+
 // true if the ubatch moves or clears recurrent states (then every state goes through the gather in build_rs)
 static bool rs_moves(const llama_memory_recurrent_context * mctx) {
     return !mctx->is_in_place();
@@ -338,7 +354,27 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // state_grad with gradient checkpointing: only the layers of the segment, from a given hidden state
+    const int il0 = grad_seg ? grad_seg->il0 : 0;
+    const int il1 = grad_seg ? grad_seg->il1 : n_layer;
+    auto seg_host = [&](const std::vector<float> * data) {
+        auto inp_seg = std::make_unique<llm_graph_input_seg_host>(data);
+        inp_seg->t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+        ggml_set_input(inp_seg->t);
+        ggml_tensor * t = inp_seg->t;
+        res->add_input(std::move(inp_seg));
+        return t;
+    };
+
+    if (il0 > 0) {
+        inpL = seg_host(grad_seg->inp);
+        if (!grad_seg->fwd_only) {
+            ggml_set_param(inpL);
+        }
+        res->t_seg_inp = inpL;
+    } else {
+        inpL = build_inp_embd(model.tok_embd);
+    }
 
     cb(inpL, "model.input_embed", -1);
 
@@ -398,7 +434,7 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
         inp_mem = (llm_graph_input_mem_rma *) res->add_input(std::move(inp_rma));
     }
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il0; il < il1; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -448,6 +484,19 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
     cur = inpL;
+
+    if (il1 < n_layer) {
+        // not the last segment: the output hidden state, and as the loss its dot product with the given gradient
+        res->t_seg_out = cur;
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+        if (!grad_seg->fwd_only) {
+            res->t_loss = ggml_sum(ctx0, ggml_mul(ctx0, cur, seg_host(grad_seg->grad)));
+            ggml_set_loss(res->t_loss);
+            ggml_build_forward_expand(gf, res->t_loss);
+        }
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 

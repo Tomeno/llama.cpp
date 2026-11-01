@@ -791,6 +791,15 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// state_grad with gradient checkpointing: a graph over the layers [il0, il1) only
+struct llm_graph_grad_seg {
+    int32_t il0 = 0;
+    int32_t il1 = 0;
+    bool fwd_only = false;                     // no loss, no backward pass: the hidden state at il1 is the output
+    const std::vector<float> * inp  = nullptr; // [n_embd, n_tokens] hidden state at il0 (il0 > 0)
+    const std::vector<float> * grad = nullptr; // [n_embd, n_tokens] gradient of the hidden state at il1 (il1 < n_layer)
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -839,6 +848,7 @@ struct llm_graph_params {
 
     const std::vector<llama_token> * lp_targets = nullptr; // target token per output row of the ubatch (logprobs_temp > 0)
     const std::vector<float>       * lp_weights = nullptr; // loss weight per output row of the ubatch (state_grad)
+    const llm_graph_grad_seg       * grad_seg   = nullptr; // state_grad with gradient checkpointing: the segment
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -976,6 +986,8 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_logprobs    = nullptr; // [n_outputs] log-probs of the targets (logprobs_temp > 0)
     ggml_tensor * t_loss        = nullptr; // sum of the weighted log-probs (state_grad)
+    ggml_tensor * t_seg_inp     = nullptr; // state_grad segment: [n_embd, n_tokens] input hidden state (a parameter)
+    ggml_tensor * t_seg_out     = nullptr; // ... output hidden state (not the last segment)
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1089,6 +1101,7 @@ struct llm_graph_context {
 
     const std::vector<llama_token> * lp_targets;
     const std::vector<float>       * lp_weights;
+    const llm_graph_grad_seg       * grad_seg;
 
     const llm_graph_cb & cb_func;
 

@@ -91,6 +91,7 @@ struct llama_context {
 
     // state-gradient mode, see llama_set_state_grad
     void    set_state_grad(bool on);
+    void    set_state_grad_ckpt(int32_t n_layers);
     void    set_state_grad_weights(const float * w, int32_t n);
     int64_t get_state_grad(llama_seq_id seq_id, int32_t il, float * dst) const;
 
@@ -155,12 +156,23 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
-    // process_ubatch in state-gradient mode: forward and backward graph, the gradients go to state_grads
+    // process_ubatch in state-gradient mode: forward and backward graphs, the gradients go to state_grads
     llm_graph_result * process_ubatch_grad(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
                        ggml_status & ret);
+
+    // one graph of the state-gradient mode, over the layers of seg (nullptr: all): forward only (seg->fwd_only, the
+    // output hidden state to out) or forward and backward (the state gradients to state_grads, the gradient of the
+    // input hidden state to g_inp)
+    ggml_status grad_pass(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+      const llm_graph_grad_seg * seg,
+                std::vector<float> * out,
+                std::vector<float> * g_inp);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -447,6 +459,8 @@ private:
     llm_graph_result_ptr gf_res_grad;
     ggml_context_ptr     ctx_grad;
     size_t               sched_max_nodes_grad = 0;
+    std::vector<float>   lp_grad;               // the log-probs of the last decode
+    const llm_graph_grad_seg * grad_seg_cur = nullptr; // the segment of the graph being built
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
