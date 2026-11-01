@@ -2449,7 +2449,7 @@ struct test_get_rows : public test_case {
             ggml_set_name(rows, "view_of_rows");
         }
 
-        const bool grad_supported = !vs0 && ggml_is_matrix(in) && ggml_is_vector(rows);
+        const bool grad_supported = !vs0;
         if (grad_supported) {
             ggml_set_param(in);
             // rows is a constant input -> no gradients
@@ -10204,9 +10204,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 4, 6, 5, 2, 3)); // batched, small enough for the gradient check
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 256, 1280, 1024, 4, false)); // batched, EdgeRock's memory commit
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 7, 70000, 70000, 2, false));
     for (ggml_type type : all_types) {
         for (bool v : {false, true}) {
             test_cases.emplace_back(new test_get_rows_back(type, 256, 5, 4, 1, v));
