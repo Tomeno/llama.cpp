@@ -838,6 +838,7 @@ struct llm_graph_params {
     llm_graph_result * res;
 
     const std::vector<llama_token> * lp_targets = nullptr; // target token per output row of the ubatch (logprobs_temp > 0)
+    const std::vector<float>       * lp_weights = nullptr; // loss weight per output row of the ubatch (state_grad)
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -974,11 +975,15 @@ public:
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_logprobs    = nullptr; // [n_outputs] log-probs of the targets (logprobs_temp > 0)
+    ggml_tensor * t_loss        = nullptr; // sum of the weighted log-probs (state_grad)
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+
+    // state_grad: per layer, the initial recurrent state [n_embd_s, n_seqs] as a parameter (nullptr: no state)
+    std::vector<ggml_tensor *> t_state_param;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1083,6 +1088,7 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const std::vector<llama_token> * lp_targets;
+    const std::vector<float>       * lp_weights;
 
     const llm_graph_cb & cb_func;
 

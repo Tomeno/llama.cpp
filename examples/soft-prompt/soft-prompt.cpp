@@ -572,6 +572,83 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, 
     }
 }
 
+SP_API int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_idx, int32_t n_jobs,
+                             const int32_t * post, const int64_t * post_off, const int32_t * post_len,
+                             const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
+                             const float * w, float temp, float * logp, float * grad) {
+    try {
+        if (!(temp > 0.0f)) {
+            throw std::runtime_error("sp_state_grad needs temp > 0");
+        }
+        if (!c->before.empty() || !c->init.empty()) {
+            throw std::runtime_error("sp_state_grad: the state is the initial one, no prefix");
+        }
+        llama_memory_t mem = llama_get_memory(c->ctx);
+        std::vector<float> g;
+
+        llama_set_logprobs(c->ctx, temp);
+        llama_set_state_grad(c->ctx, true);
+        // one sequence per decode: the whole sequence has to be in one ubatch
+        for (int j = 0; j < n_jobs; ++j) {
+            if (post_len[j] < 1 || resp_len[j] < 1) {
+                throw std::runtime_error("every job needs at least one prompt and one response token");
+            }
+            const int n = post_len[j] + resp_len[j] - 1; // the last response token is only a target
+            if (n > c->n_batch) {
+                throw std::runtime_error("job " + std::to_string(j) + ": " + std::to_string(n) + " tokens, more than the batch size");
+            }
+            llama_memory_clear(mem, true);
+            if (!llama_memory_seq_seed(c->ctx, 0)) {
+                throw std::runtime_error("failed to seed sequence 0");
+            }
+            const float * st = states + (size_t) state_idx[j]*c->n_state;
+            set_state(c, 0, st);
+
+            std::vector<llama_token> toks(post + post_off[j], post + post_off[j] + post_len[j]);
+            toks.insert(toks.end(), resp + resp_off[j], resp + resp_off[j] + resp_len[j]);
+
+            const int s0 = post_len[j] - 1;
+            std::vector<sp_item>     items;
+            std::vector<llama_token> targets;
+            std::vector<float>       weights;
+            for (int i = 0; i < n; ++i) {
+                const bool out = i >= s0;
+                items.push_back({ 0, toks[i], i, out });
+                targets.push_back(out ? toks[i + 1] : 0);
+                weights.push_back(out ? w[resp_off[j] + i - s0] : 0.0f);
+            }
+            llama_set_logprob_targets(c->ctx, targets.data(), (int32_t) targets.size());
+            llama_set_state_grad_weights(c->ctx, weights.data(), (int32_t) weights.size());
+            decode_items(c, items);
+
+            for (int i = s0; i < n; ++i) {
+                logp[resp_off[j] + i - s0] = llama_get_logprob_ith(c->ctx, i);
+            }
+            float * dst = grad + (size_t) state_idx[j]*c->n_state;
+            for (auto [il, ns] : c->state_layers) {
+                g.resize(ns);
+                if (llama_get_state_grad(c->ctx, 0, il, g.data()) != ns) {
+                    throw std::runtime_error("no state gradient for layer " + std::to_string(il));
+                }
+                for (int64_t k = 0; k < ns; ++k) {
+                    dst[k] += g[k];
+                }
+                dst += ns;
+            }
+        }
+        llama_set_state_grad(c->ctx, false);
+        llama_set_logprobs(c->ctx, 0.0f);
+        llama_memory_clear(mem, true);
+        return 0;
+    } catch (const std::exception & e) {
+        llama_set_state_grad(c->ctx, false);
+        llama_set_logprobs(c->ctx, 0.0f);
+        llama_memory_clear(llama_get_memory(c->ctx), true);
+        g_error = e.what();
+        return -1;
+    }
+}
+
 // samples the tokens of the outputs idx[k] with the samplers smpl[k] on c->n_threads threads (as llama_sampler_sample on
 // the CPU logits); buf[k]: the candidate buffer of sampler k
 static std::vector<llama_token> sample_outputs(sp_ctx * c, const std::vector<llama_sampler *> & smpl, const std::vector<int32_t> & idx,

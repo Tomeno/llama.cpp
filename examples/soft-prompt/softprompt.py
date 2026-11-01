@@ -62,10 +62,12 @@ def _load_lib(path: str) -> ctypes.CDLL:
     lib.sp_token_embeddings.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32, _f32p]
     lib.sp_score.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, _i32p, ctypes.c_int32,
                              _i32p, _i64p, _i32p, _i32p, _i64p, _i32p, ctypes.c_float, _f32p]
+    lib.sp_state_grad.argtypes = [ctypes.c_void_p, _f32p, _i32p, ctypes.c_int32, _i32p, _i64p, _i32p, _i32p, _i64p, _i32p,
+                                  _f32p, ctypes.c_float, _f32p, _f32p]
     lib.sp_generate.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, ctypes.c_int32,
                                 _i32p, _i64p, _i32p, ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
                                 ctypes.c_uint64, _i32p, _i32p, _i32p]
-    for f in ("sp_score", "sp_generate", "sp_token_embeddings", "sp_get_state"):
+    for f in ("sp_score", "sp_generate", "sp_token_embeddings", "sp_get_state", "sp_state_grad"):
         getattr(lib, f).restype = ctypes.c_int32
     return lib
 
@@ -198,6 +200,24 @@ class Engine:
                                       _ptr(pf, _i32p), _ptr(po, _i64p), _ptr(pl, _i32p),
                                       _ptr(rf, _i32p), _ptr(ro, _i64p), _ptr(rl, _i32p), float(temp), _ptr(out, _f32p)))
         return [out[o:o + n] for o, n in zip(ro, rl)]
+
+    def state_grad(self, states: np.ndarray, state_idx: Sequence[int], posts: Sequence[np.ndarray], resps: Sequence[np.ndarray],
+                   weights: Sequence[np.ndarray], temp: float = 1.0) -> tuple[list[np.ndarray], np.ndarray]:
+        """Gradient of sum_j sum_t weights[j][t] * log p(resps[j][t]) with respect to the initial recurrent states (no
+        prefix), job j starting from states[state_idx[j]]; returns (log-probs per job, gradient [n_states, n_state])."""
+        st = np.ascontiguousarray(states, dtype=np.float32).reshape(-1, self.n_state)
+        idx = np.ascontiguousarray(state_idx, dtype=np.int32)
+        pf, po, pl = _pack(posts)
+        rf, ro, rl = _pack(resps)
+        w = np.ascontiguousarray(np.concatenate([np.asarray(x, dtype=np.float32) for x in weights]))
+        assert len(w) == len(rf), "one weight per response token"
+        lp = np.zeros(len(rf), dtype=np.float32)
+        grad = np.zeros_like(st)
+        self._check(self.lib.sp_state_grad(self.ctx, _ptr(st, _f32p), _ptr(idx, _i32p), len(idx),
+                                           _ptr(pf, _i32p), _ptr(po, _i64p), _ptr(pl, _i32p),
+                                           _ptr(rf, _i32p), _ptr(ro, _i64p), _ptr(rl, _i32p),
+                                           _ptr(w, _f32p), float(temp), _ptr(lp, _f32p), _ptr(grad, _f32p)))
+        return [lp[o:o + n] for o, n in zip(ro, rl)], grad
 
     def generate(self, theta: np.ndarray, posts: Sequence[np.ndarray], max_new: int, temp: float = 0.6, top_p: float = 0.95,
                  top_k: int = 20, seed: int = 0, state: np.ndarray | None = None) -> list[tuple[np.ndarray, bool]]:

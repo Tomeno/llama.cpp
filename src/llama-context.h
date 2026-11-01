@@ -89,6 +89,11 @@ struct llama_context {
     void  set_logprob_targets(const llama_token * targets, int32_t n);
     float get_logprob_ith(int32_t i);
 
+    // state-gradient mode, see llama_set_state_grad
+    void    set_state_grad(bool on);
+    void    set_state_grad_weights(const float * w, int32_t n);
+    int64_t get_state_grad(llama_seq_id seq_id, int32_t il, float * dst) const;
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -145,6 +150,13 @@ struct llama_context {
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
     llm_graph_result * process_ubatch(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+
+    // process_ubatch in state-gradient mode: forward and backward graph, the gradients go to state_grads
+    llm_graph_result * process_ubatch_grad(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
@@ -364,6 +376,11 @@ private:
 
     std::vector<llama_token> lp_targets_batch; // log-prob mode: target per batch token
     std::vector<llama_token> lp_targets_ub;    // ... per output row of the current ubatch
+    std::vector<float>       lp_weights_batch; // state-gradient mode: loss weight per batch token
+    std::vector<float>       lp_weights_ub;    // ... per output row of the current ubatch
+
+    // state-gradient mode: gradient of the loss per sequence and layer (empty: no state on that layer)
+    std::map<llama_seq_id, std::vector<std::vector<float>>> state_grads;
     std::vector<float>       lp_out;           // ... log-prob per output row
 
     struct swap_info {
@@ -425,6 +442,11 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // state-gradient mode: the forward graph, the context of the backward graph, the node budget of the scheduler
+    llm_graph_result_ptr gf_res_grad;
+    ggml_context_ptr     ctx_grad;
+    size_t               sched_max_nodes_grad = 0;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

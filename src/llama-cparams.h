@@ -22,6 +22,7 @@ struct llama_cparams {
     int32_t  nextn_layer_offset = 0;
 
     float logprobs_temp = 0.0f; // > 0: every output is the log-prob of a given target token at this temperature, no logits
+    bool  state_grad    = false; // log-prob mode: also the gradient of the weighted log-probs w.r.t. the initial recurrent states
 
     float rope_freq_base;
     float rope_freq_scale;

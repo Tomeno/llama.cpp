@@ -2595,7 +2595,16 @@ struct llama_model_edgerock : public llama_model_qwen35 {
                     ggml_tensor * input,
                             int   il);
 
+        // state_grad: attention over the K/V of the ubatch itself (no KV cache, so the gradients reach K and V)
+        ggml_tensor * build_attn_grad(
+                    ggml_tensor * q,
+                    ggml_tensor * k,
+                    ggml_tensor * v,
+                          float   kq_scale);
+
         const llama_model & model;
+
+        ggml_tensor * kq_mask_grad = nullptr; // state_grad: [n_tokens, n_tokens] causal sliding window mask of the ubatch
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

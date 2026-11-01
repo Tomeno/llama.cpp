@@ -54,6 +54,59 @@ static rma_counts rma_get_counts(const llama_ubatch & ubatch, int64_t P) {
     return c;
 }
 
+// state_grad: the initial recurrent states of the ubatch sequences on one layer, as a parameter: a copy of their cache rows
+class llm_graph_input_rs_param : public llm_graph_input_i {
+public:
+    llm_graph_input_rs_param(const llama_memory_recurrent_context * mctx, ggml_tensor * s_all) : mctx(mctx), s_all(s_all) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(s_all->type == GGML_TYPE_F32);
+
+        const size_t row = ggml_row_size(param->type, param->ne[0]);
+        std::vector<uint8_t> buf(row);
+        for (int64_t i = 0; i < param->ne[1]; ++i) {
+            const int32_t cell = mctx->s_copy(i);
+            if (cell == mctx->get_rs_z()) {
+                std::fill(buf.begin(), buf.end(), 0); // cleared in the graph before it is read
+            } else {
+                ggml_backend_tensor_get(s_all, buf.data(), cell*s_all->nb[1], row);
+            }
+            ggml_backend_tensor_set(param, buf.data(), i*param->nb[1], row);
+        }
+    }
+
+    const llama_memory_recurrent_context * mctx;
+    ggml_tensor * s_all;
+
+    ggml_tensor * param = nullptr; // F32 [n_embd_s, n_seqs]
+};
+
+// state_grad: causal sliding window mask over the tokens of the ubatch (sequence by sequence)
+class llm_graph_input_kq_mask_grad : public llm_graph_input_i {
+public:
+    llm_graph_input_kq_mask_grad(int64_t n_swa) : n_swa(n_swa) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const int64_t n = ubatch->n_tokens;
+        std::vector<float> data(n*n, -INFINITY);
+        for (int64_t i = 0; i < n; ++i) {
+            for (int64_t j = 0; j < n; ++j) {
+                const bool same = ubatch->seq_id[i][0] == ubatch->seq_id[j][0];
+                const llama_pos d = ubatch->pos[i] - ubatch->pos[j];
+                if (same && d >= 0 && d < n_swa) {
+                    data[i*n + j] = 0.0f; // query i (row), key j
+                }
+            }
+        }
+        ggml_backend_tensor_set(mask, data.data(), 0, ggml_nbytes(mask));
+    }
+
+    const int64_t n_swa;
+
+    ggml_tensor * mask = nullptr; // F32 [n_tokens (keys), n_tokens (queries)]
+};
+
 // true if the ubatch moves or clears recurrent states (then every state goes through the gather in build_rs)
 static bool rs_moves(const llama_memory_recurrent_context * mctx) {
     return !mctx->is_in_place();
@@ -294,6 +347,14 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    if (cparams.state_grad) {
+        auto inp_mask = std::make_unique<llm_graph_input_kq_mask_grad>(hparams.n_swa);
+        inp_mask->mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
+        ggml_set_input(inp_mask->mask);
+        kq_mask_grad = inp_mask->mask;
+        res->add_input(std::move(inp_mask));
+    }
+
     llm_graph_input_mem_rma * inp_mem;
     {
         auto inp_rma = std::make_unique<llm_graph_input_mem_rma>(hparams.n_mem_chunk, n_head_kv, ubatch, inp->get_recr()->mctx);
@@ -315,7 +376,9 @@ llama_model_edgerock::graph::graph(const llama_model & model, const llm_graph_pa
             ggml_set_input(inp_rma->commit_idx);
             ggml_set_input(inp_rma->commit_on);
         }
-        if (inp_rma->pend_in_place) {
+        if (cparams.state_grad) {
+            // the records are not stored
+        } else if (inp_rma->pend_in_place) {
             inp_rma->pend_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I64, ubatch.n_seq_tokens*n_head_kv, S);
             ggml_set_input(inp_rma->pend_rows);
         } else {
@@ -599,8 +662,8 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_mem(
         ggml_build_forward_expand(gf, read);
     }
 
-    // store the records
-    {
+    // store the records (state_grad: not, the backward pass may still read the committed records in place)
+    if (!cparams.state_grad) {
         const rma_state & st = states.back();
 
         auto store = [&](ggml_tensor * src, ggml_tensor * dst_all, int64_t n, int64_t offset) {
@@ -773,9 +836,13 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (cparams.state_grad) {
+        cur = build_attn_grad(Qcur, Kcur, Vcur, kq_scale);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
@@ -788,6 +855,27 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_attn(
     cb(cur, "attn_output", il);
 
     return cur;
+}
+
+ggml_tensor * llama_model_edgerock::graph::build_attn_grad(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        float         kq_scale) {
+    const int64_t D = q->ne[0];
+    const int64_t H = q->ne[1];
+
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);                                                   // [D, T, H]
+    k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));                                  // [D, T, H_kv]
+    v = ggml_cont(ctx0, ggml_permute(ctx0, v, 1, 2, 0, 3));                                  // [T, D, H_kv]
+
+    ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);                                             // [T (keys), T, H]
+    kq = ggml_soft_max_ext(ctx0, kq, kq_mask_grad, kq_scale, 0.0f);
+
+    ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);                                           // [D, T, H]
+    kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3);                                               // [D, H, T]
+
+    return ggml_cont_2d(ctx0, kqv, D*H, n_tokens);
 }
 
 ggml_tensor * llama_model_edgerock::graph::build_layer_attn_linear(
@@ -842,7 +930,19 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state;
+    if (cparams.state_grad) {
+        auto inp_param = std::make_unique<llm_graph_input_rs_param>(inp->mctx, ssm_states_all);
+        inp_param->param = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_s(), n_seqs);
+        ggml_set_input(inp_param->param);
+        ggml_set_param(inp_param->param);
+        ggml_format_name(inp_param->param, "state_param-%d", il);
+        res->t_state_param[il] = inp_param->param;
+        state = inp_param->param;
+        res->add_input(std::move(inp_param));
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    }
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -893,7 +993,7 @@ ggml_tensor * llama_model_edgerock::graph::build_layer_attn_linear(
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch || cparams.state_grad)) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
         q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);

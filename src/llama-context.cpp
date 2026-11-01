@@ -1092,6 +1092,26 @@ void llama_context::set_logprob_targets(const llama_token * targets, int32_t n) 
     lp_targets_batch.assign(targets, targets + n);
 }
 
+void llama_context::set_state_grad(bool on) {
+    cparams.state_grad = on;
+}
+
+void llama_context::set_state_grad_weights(const float * w, int32_t n) {
+    lp_weights_batch.assign(w, w + n);
+}
+
+int64_t llama_context::get_state_grad(llama_seq_id seq_id, int32_t il, float * dst) const {
+    const auto it = state_grads.find(seq_id);
+    if (it == state_grads.end() || il < 0 || il >= (int32_t) it->second.size()) {
+        return -1;
+    }
+    const auto & g = it->second[il];
+    if (dst && !g.empty()) {
+        std::copy(g.begin(), g.end(), dst);
+    }
+    return (int64_t) g.size();
+}
+
 float llama_context::get_logprob_ith(int32_t i) {
     output_reorder();
 
@@ -1548,6 +1568,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (cparams.state_grad) {
+        return process_ubatch_grad(ubatch, gtype, mctx, ret);
+    }
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1609,6 +1633,136 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    ret = GGML_STATUS_SUCCESS;
+
+    return res;
+}
+
+llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    ret = GGML_STATUS_FAILED;
+
+    if (cparams.logprobs_temp <= 0.0f) {
+        LLAMA_LOG_ERROR("%s: the state-gradient mode needs the log-prob mode\n", __func__);
+        return nullptr;
+    }
+    if (!ubatch.equal_seqs()) {
+        LLAMA_LOG_ERROR("%s: the state-gradient mode needs a recurrent model\n", __func__);
+        return nullptr;
+    }
+    // the parameters are the states before the first token, so every sequence has to start in this ubatch
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        if (ubatch.pos[s*ubatch.n_seq_tokens] != 0) {
+            LLAMA_LOG_ERROR("%s: every sequence must start at position 0 and fit in one ubatch\n", __func__);
+            return nullptr;
+        }
+    }
+
+    // forward + backward graph: a larger scheduler, no graph reuse
+    const size_t max_nodes = 6*graph_max_nodes(ubatch.n_tokens);
+    if (sched_max_nodes_grad < max_nodes) {
+        sched_new(max_nodes, cparams.pipeline_parallel);
+        sched_max_nodes_grad = max_nodes;
+    }
+    gf_res_prev_active = nullptr;
+    if (!gf_res_grad || gf_res_grad->get_max_nodes() < (int64_t) max_nodes) {
+        gf_res_grad.reset(new llm_graph_result(max_nodes));
+    } else {
+        gf_res_grad->reset();
+    }
+    auto * res = gf_res_grad.get();
+
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+    ggml_cgraph * gf = model.build_graph(graph_params(res, ubatch, mctx, gtype));
+    if (!gf || !res->t_loss) {
+        LLAMA_LOG_ERROR("%s: failed to build the graph (the model needs a state-gradient mode)\n", __func__);
+        return nullptr;
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    {
+        const size_t size = ggml_graph_size(gf);
+        ggml_init_params params = {
+            /*.mem_size   =*/ 4*size*ggml_tensor_overhead() + ggml_graph_overhead_custom(size, true),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_grad.reset(ggml_init(params));
+    }
+    ggml_context * ctx = ctx_grad.get();
+
+    // the gradient of the loss is 1
+    std::vector<ggml_tensor *> grad_accs(n_nodes, nullptr);
+    ggml_tensor * seed = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_input(seed);
+    for (int i = 0; i < n_nodes; ++i) {
+        if (ggml_graph_node(gf, i) == res->t_loss) {
+            grad_accs[i] = seed;
+        }
+    }
+
+    ggml_cgraph * gb = ggml_graph_dup(ctx, gf, /*force_grads =*/ true);
+    ggml_build_backward_expand(ctx, gb, grad_accs.data());
+
+    std::vector<ggml_tensor *> grads(res->t_state_param.size(), nullptr);
+    for (size_t il = 0; il < grads.size(); ++il) {
+        ggml_tensor * p = res->t_state_param[il];
+        if (!p) {
+            continue;
+        }
+        ggml_tensor * g = ggml_graph_get_grad(gb, p);
+        if (g) {
+            if (!ggml_is_contiguous(g)) {
+                g = ggml_cont(ctx, g);
+                ggml_build_forward_expand(gb, g);
+            }
+            ggml_set_output(g);
+        }
+        grads[il] = g;
+    }
+    ggml_set_output(res->t_logprobs);
+
+    LLAMA_LOG_DEBUG("%s: %d forward nodes, %d with the backward pass\n", __func__, n_nodes, ggml_graph_n_nodes(gb));
+
+    if (!ggml_backend_sched_alloc_graph(sched.get(), gb)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the graph\n", __func__);
+        ret = GGML_STATUS_ALLOC_FAILED;
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        LLAMA_LOG_DEBUG("%s: %s compute buffer %.1f MiB\n", __func__, ggml_backend_name(backend_ptrs[i]),
+                ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) / 1024.0 / 1024.0);
+    }
+
+    res->set_inputs(&ubatch);
+    const float one = 1.0f;
+    ggml_backend_tensor_set(seed, &one, 0, sizeof(float));
+
+    const auto status = graph_compute(gb, true);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        ret = status;
+        return nullptr;
+    }
+
+    state_grads.clear();
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        auto & dst = state_grads[ubatch.seq_id[s*ubatch.n_seq_tokens][0]];
+        dst.resize(grads.size());
+        for (size_t il = 0; il < grads.size(); ++il) {
+            ggml_tensor * p = res->t_state_param[il];
+            if (!p) {
+                continue;
+            }
+            dst[il].assign(p->ne[0], 0.0f);
+            if (grads[il]) {
+                ggml_backend_tensor_get(grads[il], dst[il].data(), s*grads[il]->nb[1], p->ne[0]*sizeof(float));
+            }
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2042,6 +2196,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 const int32_t b = out_ids[n_outputs_prev + r];
                 GGML_ASSERT(b >= 0 && b < (int32_t) lp_targets_batch.size() && "llama_set_logprob_targets: missing targets");
                 lp_targets_ub[r] = lp_targets_batch[b];
+            }
+            if (cparams.state_grad) {
+                lp_weights_ub.resize(n_outputs);
+                for (uint32_t r = 0; r < n_outputs; ++r) {
+                    const int32_t b = out_ids[n_outputs_prev + r];
+                    GGML_ASSERT(b < (int32_t) lp_weights_batch.size() && "llama_set_state_grad_weights: missing weights");
+                    lp_weights_ub[r] = lp_weights_batch[b];
+                }
             }
         }
 
@@ -2769,6 +2931,7 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.lp_targets  =*/ &lp_targets_ub,
+        /*.lp_weights  =*/ &lp_weights_ub,
     };
 }
 
@@ -4451,6 +4614,18 @@ void llama_set_logprobs(llama_context * ctx, float temp) {
 
 void llama_set_logprob_targets(llama_context * ctx, const llama_token * targets, int32_t n_tokens) {
     ctx->set_logprob_targets(targets, n_tokens);
+}
+
+void llama_set_state_grad(llama_context * ctx, bool on) {
+    ctx->set_state_grad(on);
+}
+
+void llama_set_state_grad_weights(llama_context * ctx, const float * w, int32_t n_tokens) {
+    ctx->set_state_grad_weights(w, n_tokens);
+}
+
+int64_t llama_get_state_grad(llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst) {
+    return ctx->get_state_grad(seq_id, il, dst);
 }
 
 float llama_get_logprob_ith(llama_context * ctx, int32_t i) {

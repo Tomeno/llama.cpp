@@ -1402,12 +1402,15 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_logprobs    = nullptr;
+    t_loss        = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+
+    t_state_param.assign(LLAMA_MAX_LAYERS, nullptr);
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1583,6 +1586,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hdmd             (params.hdmd),
     samplers         (params.samplers),
     lp_targets       (params.lp_targets),
+    lp_weights       (params.lp_weights),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -4220,7 +4224,8 @@ void llm_graph_context::build_logits() const {
 // flat indices row*n_vocab + target of the target tokens in the probabilities [n_vocab, n_outputs]
 class llm_graph_input_logprobs : public llm_graph_input_i {
 public:
-    llm_graph_input_logprobs(const std::vector<llama_token> * targets, int64_t n_vocab) : targets(targets), n_vocab(n_vocab) {}
+    llm_graph_input_logprobs(const std::vector<llama_token> * targets, const std::vector<float> * weights, int64_t n_vocab) :
+        targets(targets), weights(weights), n_vocab(n_vocab) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         GGML_UNUSED(ubatch);
@@ -4233,17 +4238,25 @@ public:
             data[r] = (int32_t) (r*n_vocab + t);
         }
         ggml_backend_tensor_set(idx, data.data(), 0, ggml_nbytes(idx));
+
+        if (w) {
+            GGML_ASSERT(weights && (int64_t) weights->size() >= n);
+            ggml_backend_tensor_set(w, weights->data(), 0, ggml_nbytes(w));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
         targets = params.lp_targets;
+        weights = params.lp_weights;
         return true;
     }
 
     const std::vector<llama_token> * targets;
+    const std::vector<float>       * weights;
     const int64_t n_vocab;
 
     ggml_tensor * idx = nullptr; // I32 [n_outputs]
+    ggml_tensor * w   = nullptr; // F32 [n_outputs], state_grad only
 };
 
 void llm_graph_context::build_logprobs() const {
@@ -4253,9 +4266,33 @@ void llm_graph_context::build_logprobs() const {
     const int64_t n_vocab = res->t_logits->ne[0];
     GGML_ASSERT(ggml_nelements(res->t_logits) <= INT32_MAX && "too many outputs for the int32 target indices");
 
-    auto inp = std::make_unique<llm_graph_input_logprobs>(lp_targets, n_vocab);
+    auto inp = std::make_unique<llm_graph_input_logprobs>(lp_targets, lp_weights, n_vocab);
     inp->idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, res->t_logits->ne[1]);
     ggml_set_input(inp->idx);
+
+    if (cparams.state_grad) {
+        // no in-place ops and no clamp (no backward pass): FLT_MIN is added instead, so log(0) is about -87.3 as well
+        ggml_tensor * p = res->t_logits;
+        if (cparams.logprobs_temp != 1.0f) {
+            p = ggml_scale(ctx0, p, 1.0f/cparams.logprobs_temp);
+        }
+        p = ggml_soft_max(ctx0, p);
+        p = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, p, 1, ggml_nelements(p)), inp->idx); // [1, n_outputs]
+        p = ggml_log(ctx0, ggml_scale_bias(ctx0, p, 1.0f, FLT_MIN));
+        p = ggml_reshape_1d(ctx0, p, ggml_nelements(p));
+
+        inp->w = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, ggml_nelements(p));
+        ggml_set_input(inp->w);
+
+        res->t_loss = ggml_sum(ctx0, ggml_mul(ctx0, p, inp->w));
+        ggml_set_loss(res->t_loss);
+
+        res->add_input(std::move(inp));
+        res->t_logprobs = p;
+        ggml_build_forward_expand(gf, p);
+        ggml_build_forward_expand(gf, res->t_loss);
+        return;
+    }
 
     // in place: the logits are not copied out in this mode
     ggml_tensor * p = res->t_logits;

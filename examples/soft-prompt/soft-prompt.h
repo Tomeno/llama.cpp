@@ -34,6 +34,14 @@ int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, int32_t
                  const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
                  float temp, float * out);
 
+// gradient of sum_t w[t] * log p(resp[t]) with respect to the initial recurrent state (before the first prompt token, no
+// prefix): job j starts from states[state_idx[j]] and adds its gradient to grad[state_idx[j]] ([n_states, n_state], not
+// cleared); logp gets the log-probs (laid out as resp, w too). Every job must fit in one batch.
+int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_idx, int32_t n_jobs,
+                      const int32_t * post, const int64_t * post_off, const int32_t * post_len,
+                      const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
+                      const float * w, float temp, float * logp, float * grad);
+
 int32_t sp_generate(sp_ctx * c, const float * theta, const float * state, int32_t n_soft, int32_t n_prompts,
                     const int32_t * post, const int64_t * post_off, const int32_t * post_len,
                     int32_t max_new, float temp, float top_p, int32_t top_k, uint64_t seed,

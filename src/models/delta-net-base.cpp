@@ -229,6 +229,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     // [CS, S_v, n_chunks, H_v * n_seqs]
     ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v));
 
+    // state_grad: the chunk outputs are concatenated instead of set in place (no backward pass for in-place ops)
+    ggml_tensor * o_all = nullptr;
+
     for (int64_t chunk = 0; chunk < n_chunks; chunk++) {
         ggml_tensor * ch_k_cd    = get_slice_2d(ctx0, k_cd,    chunk); // [S_k,  CS, 1, H_k * n_seqs]
         ggml_tensor * ch_v_t     = get_slice_2d(ctx0, v_t,     chunk); // [ CS, S_v, 1, H_v * n_seqs]
@@ -256,7 +259,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * o_ch = ggml_add(ctx0, attn_inter, v_attn);
         cb(o_ch, "dnet_add_ch_attn_out", il);
 
-        v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        if (cparams.state_grad) {
+            o_all = o_all ? ggml_concat(ctx0, o_all, o_ch, 2) : o_ch;
+        } else {
+            v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        }
 
         // kgdmulvnew = (key_gdiff).transpose(-1, -2) @ v_new
         // TODO: head broadcast might not work here - probably will need a transpose
@@ -268,6 +275,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         s = ggml_mul(ctx0, s, ch_g_last_exp_t);
         s = ggml_add(ctx0, s, kgv);
         cb(s, "dnet_add_ch_state", il);
+    }
+
+    if (o_all) {
+        v = o_all;
     }
 
     // truncate padded tokens
@@ -436,7 +447,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }
 
-    if (cparams.fused_gdn_ch) {
+    if (cparams.fused_gdn_ch && !cparams.state_grad) {
         return build_delta_net_fused(q, k, v, g, b, s, il);
     }
 
@@ -549,10 +560,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        // state_grad: the cache is not written (the backward pass may still read the old states in place)
+        if (!cparams.state_grad) {
+            ggml_build_forward_expand(gf,
+                    ggml_cpy(ctx0, new_state,
+                        ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        }
 
         return output;
     }
