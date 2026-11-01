@@ -1749,6 +1749,9 @@ llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatc
         return nullptr;
     }
 
+    // the graph runs asynchronously
+    ggml_backend_sched_synchronize(sched.get());
+
     state_grads.clear();
     for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
         auto & dst = state_grads[ubatch.seq_id[s*ubatch.n_seq_tokens][0]];
