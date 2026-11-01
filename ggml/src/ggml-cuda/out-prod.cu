@@ -1,4 +1,5 @@
 #include "out-prod.cuh"
+#include "convert.cuh"
 
 #include <cstdint>
 
@@ -24,9 +25,72 @@ static __global__ void k_compute_out_prod_ptrs(
     ptrs_c[idx] = dst_d  +  i3      *s3  +  i2      *s2;
 }
 
+bool ggml_cuda_out_prod_supported(const ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    if (op->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->type == GGML_TYPE_F32) {
+        return true;
+    }
+    // other types (the gradient of a mul_mat with a quantized weight) as a single matrix
+    return ggml_get_to_fp32_cuda(src0->type) != nullptr && ggml_is_contiguous(src0) && ggml_is_matrix(src0) && ggml_is_matrix(op);
+}
+
+// dst = src0 * src1^T with src0 dequantized in slices of rows (the summed dimension), so that the F32 copy stays small
+static void out_prod_dequant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(ne01 == ne11);
+    GGML_ASSERT(ne0 == ne00);
+    GGML_ASSERT(ne1 == ne10);
+
+    const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+    GGML_ASSERT(to_fp32 != nullptr);
+
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float       *)  dst->data;
+
+    cudaStream_t   stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+
+    const bool src1_T = ggml_is_transposed(src1);
+    const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const int64_t           ldb            = (src1_T ?        nb10 :        nb11) /  sizeof(float);
+    GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
+
+    const int64_t ldc = nb1 / sizeof(float);
+
+    const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(ne01, (int64_t(64) << 20) / ne00));
+    ggml_cuda_pool_alloc<float> src0_f32(ctx.pool(), rows*ne00);
+
+    for (int64_t r0 = 0; r0 < ne01; r0 += rows) {
+        const int64_t nr = std::min(rows, ne01 - r0);
+        to_fp32((const char *) src0->data + r0*nb01, src0_f32.get(), nr*ne00, stream);
+        CUDA_CHECK(cudaGetLastError());
+
+        const float alpha = 1.0f;
+        const float beta  = r0 == 0 ? 0.0f : 1.0f;
+        CUBLAS_CHECK(
+            cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
+                    ne0, ne1, nr,
+                    &alpha, src0_f32.get(), ne00,
+                            src1_d + r0*(nb11 / sizeof(float)), ldb,
+                    &beta,  dst_d, ldc));
+    }
+}
+
 void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (src0->type != GGML_TYPE_F32) {
+        out_prod_dequant(ctx, dst);
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

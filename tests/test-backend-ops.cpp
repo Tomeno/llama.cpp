@@ -11559,6 +11559,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 256, 16, 16, {3, 2}, {2, 1}, false, view_a));
     }
 
+    // the gradient of a mul_mat with a quantized weight: out_prod(weight, transpose(grad))
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 512, 37, 1024, {1, 1}, {1, 1}, true));
+    }
+
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
