@@ -8358,16 +8358,17 @@ struct test_acc : public test_case {
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
     const int64_t stride_dim;
+    const int64_t off2; // b goes to a at offset off2 along dim 2 (a slice, as the gradient of a view)
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne_a, ne_b, stride_dim);
+        return VARS_TO_STR5(type, ne_a, ne_b, stride_dim, off2);
     }
 
     test_acc(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {256, 17, 2, 3},
             std::array<int64_t, 4> ne_b = {256, 16, 2, 3},
-            uint64_t stride_dim = -1)
-        : type(type), ne_a(ne_a), ne_b(ne_b), stride_dim(stride_dim) {}
+            uint64_t stride_dim = -1, int64_t off2 = 0)
+        : type(type), ne_a(ne_a), ne_b(ne_b), stride_dim(stride_dim), off2(off2) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -8396,7 +8397,7 @@ struct test_acc : public test_case {
 
         // When ne_b[0] < ne_a[0], a->nb[1] != b->nb[1], so the stride
         // parameters to ggml_acc don't match b's natural stride.
-        ggml_tensor * out = ggml_acc(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], 0);
+        ggml_tensor * out = ggml_acc(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], off2*a->nb[2]);
         ggml_set_name(out, "out");
 
         return out;
@@ -11982,6 +11983,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {8, 16, 3, 2}, {8, 16, 1, 2}, -1, 1));
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {128, 64, 4, 32}, {128, 64, 1, 32}, -1, 3));
 
     test_cases.emplace_back(new test_pad());
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {33, 17, 2, 1}, 4, 3, true)); // circular

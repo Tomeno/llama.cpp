@@ -6779,6 +6779,9 @@ static void ggml_acc_or_set(
         const  size_t         offset) {
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
+    if (!ggml_is_contiguous(tensor)) {
+        tensor = ggml_cont(ctx, tensor); // the backends take a contiguous src1 for acc
+    }
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
