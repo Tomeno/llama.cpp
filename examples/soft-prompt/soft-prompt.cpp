@@ -377,6 +377,8 @@ SP_API sp_ctx * sp_init(const char * model_path, int32_t n_gpu_layers, int32_t n
 
         auto mparams = llama_model_default_params();
         mparams.n_gpu_layers = n_gpu_layers;
+        // the state gradient multiplies weights with out_prod, which the repacked CPU weights do not support
+        mparams.use_extra_bufts = getenv("SP_NO_REPACK") == nullptr;
         c->model = llama_model_load_from_file(model_path, mparams);
         if (!c->model) {
             throw std::runtime_error(std::string("failed to load ") + model_path);

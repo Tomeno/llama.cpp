@@ -59,6 +59,25 @@ class ES:
         return d0
 
 
+class Adam:
+    """Adam on parameters theta, for exact gradients (train_state.py --opt grad)."""
+
+    def __init__(self, theta: np.ndarray, lr: float, beta1: float = 0.9, beta2: float = 0.999):
+        self.theta = np.array(theta, dtype=np.float32)
+        self.lr, self.beta1, self.beta2 = lr, beta1, beta2
+        self.m = np.zeros_like(self.theta)
+        self.v = np.zeros_like(self.theta)
+        self.t = 0
+
+    def update(self, g: np.ndarray):
+        self.t += 1
+        self.m = self.beta1 * self.m + (1 - self.beta1) * g
+        self.v = self.beta2 * self.v + (1 - self.beta2) * g * g
+        mhat = self.m / (1 - self.beta1 ** self.t)
+        vhat = self.v / (1 - self.beta2 ** self.t)
+        self.theta -= self.lr * mhat / (np.sqrt(vhat) + 1e-8)
+
+
 def score_population(eng, pop: np.ndarray, idx, posts, resps, *args, **kw) -> list[np.ndarray]:
     """eng.score for the members of population(): job k runs member idx[k], members 2p / 2p+1 must have the same jobs
     in the same order. Every round of n_seq jobs of + members is followed by the - members in the same sequence slots:

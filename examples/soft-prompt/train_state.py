@@ -15,6 +15,11 @@ generate.py use it with --init-file).
 
 With --no-soft-prompt there is no prefix at all (no soft prompt, no before / after text): the state is the initial state
 of the model, before the first token of the prompt; s0 is zero then, so the scales come from the state of the --init-file.
+
+--opt grad (with --no-soft-prompt) replaces ES by the exact gradient (backpropagation through the model, llama.cpp's
+state-gradient mode) and Adam on the same parameters and loss: every step is one backward pass per example and per fork
+response, each sequence (prompt + response, at most --max-len tokens; longer responses are cut) in one ubatch, so -b must
+be at least --max-len. The ES options (--pairs, --sigma, --rank, --shaping) are not used; --lr is the Adam step.
 """
 
 from __future__ import annotations
@@ -55,14 +60,22 @@ def main():
     ap.add_argument("--scale-floor", type=float, default=0.1, help="minimum head scale, relative to the median")
     ap.add_argument("--no-soft-prompt", action="store_true",
                     help="no prefix: tune the initial state before the prompt (from the state of --init-file, if any)")
+    ap.add_argument("--opt", choices=["es", "grad"], default="es",
+                    help="es: antithetic ES; grad: exact gradients (needs --no-soft-prompt) and Adam")
+    ap.add_argument("--max-len", type=int, default=640,
+                    help="--opt grad: prompt + response tokens per sequence, longer responses are cut (GPU memory)")
     rollout.add_sampling_args(ap)
     rewards.add_reward_args(ap)
     args = ap.parse_args()
 
+    if args.opt == "grad" and not args.no_soft_prompt:
+        sys.exit("--opt grad tunes the initial state: it needs --no-soft-prompt")
+    if args.opt == "grad" and args.batch < args.max_len:
+        sys.exit("--opt grad: the batch (-b) must hold a whole sequence (--max-len)")
     init_file = args.init_file
     if args.no_soft_prompt:
         args.init_file, args.init_text, args.before, args.after = None, "", "", ""
-    eng, theta, tpl = setup(args, n_seq=max(args.par, 2 * args.pairs))
+    eng, theta, tpl = setup(args, n_seq=args.par if args.opt == "grad" else max(args.par, 2 * args.pairs))
     args.init_file = init_file
     if eng.n_state == 0 or eng.n_state % (HEAD * HEAD):
         sys.exit(f"the model has {eng.n_state} recurrent state values, not a stack of {HEAD} x {HEAD} matrices")
@@ -82,6 +95,8 @@ def main():
         return (s0 + scale[:, None, None] * z).reshape(len(z), -1)
 
     train = load(eng, tpl, args.train, args.max_resp)
+    if args.opt == "grad":
+        train = [(p, r[:args.max_len - len(p)]) for p, r in train if len(p) < args.max_len]
     val = load(eng, tpl, args.val, args.max_resp) if args.val else []
     if args.n_val > 0:
         val = val[:args.n_val]
@@ -90,7 +105,12 @@ def main():
         n = 0
         while n < min(len(c), len(j)) - 1 and c[n] == j[n]:
             n += 1
-        forks.append((np.concatenate([post, c[:n]]), c[n:], j[n:]))
+        post = np.concatenate([post, c[:n]])
+        if args.opt == "grad":
+            if len(post) >= args.max_len:
+                continue
+            c, j = c[:n + args.max_len - len(post)], j[:n + args.max_len - len(post)]
+        forks.append((post, c[n:], j[n:]))
     if forks:
         print(f"forks: {len(forks)} pairs, {np.mean([len(c) + len(j) for _, c, j in forks]):.1f} scored tokens per pair",
               file=sys.stderr)
@@ -154,47 +174,84 @@ def main():
         fork_cursor += 1
         return int(fork_order[fork_cursor - 1])
 
-    best, vl = evaluate(es.theta, 0)
+    opt = es_mod.Adam(z0, args.lr) if args.opt == "grad" else None
+
+    def cur() -> np.ndarray:
+        return opt.theta if opt else es.theta
+
+    def grad_step() -> str:
+        """one Adam step on the exact gradient of the loss (NLL + w_fork * fork DPO)"""
+        st = states(opt.theta[None])
+        exs = [draw() for _ in range(args.examples)]
+        n_tok = sum(len(r) for _, r in exs)
+        posts = [p for p, _ in exs]
+        resps = [r for _, r in exs]
+        ws = [np.full(len(r), -1.0 / n_tok, np.float32) for r in resps]
+        info = ""
+        F = 0.0
+        if forks:
+            # the DPO slope depends on the margin: the log-probs of the current state first
+            ks = [draw_fork() for _ in range(args.fork_examples)]
+            lp = fork_logps(st, [(0, k) for k in ks])
+            mg = (lp[:, 0] - ref[ks, 0]) - (lp[:, 1] - ref[ks, 1])
+            F = float(np.logaddexp(0.0, -args.beta * mg).mean())
+            # dF/dm = -beta sigmoid(-beta m) / n, m = log p(chosen) - log p(rejected) - ref
+            dm = -args.beta / (1.0 + np.exp(args.beta * mg)) / len(ks)
+            for k, d in zip(ks, dm):
+                post, c, j = forks[k]
+                posts += [post, post]
+                resps += [c, j]
+                ws += [np.full(len(c), args.w_fork * d, np.float32), np.full(len(j), -args.w_fork * d, np.float32)]
+            info = f", fork {F:.4f} (margin {mg.mean():+.2f})"
+        lps, g = eng.state_grad(st, [0] * len(posts), posts, resps, ws)
+        L = -sum(float(x.sum()) for x in lps[:len(exs)]) / n_tok
+        gz = g[0].reshape(s0.shape) * scale[:, None, None]
+        opt.update(gz)
+        return f"train {L + args.w_fork * F:.5f} (NLL {L:.5f}{info}), |g| {np.linalg.norm(gz):.3e}"
+
+    best, vl = evaluate(cur(), 0)
     print(f"step {0:5d}: val {vl:.5f} (init)", file=sys.stderr)
-    save(args.out, es.theta, {"step": 0, "val_loss": vl, "val_score": best})
+    save(args.out, cur(), {"step": 0, "val_loss": vl, "val_score": best})
 
     for step in range(1, args.steps + 1):
         t0 = time.time()
-        # the members' states straight from the noise: s0 + scale * (z +- sigma * eps)
-        d = es.noise() * (args.sigma * scale[:, None, None])
-        base = s0 + scale[:, None, None] * es.theta
-        st = np.empty((2 * args.pairs,) + s0.shape, dtype=np.float32)
-        np.add(base, d, out=st[0::2])
-        np.subtract(base, d, out=st[1::2])
-        # both members of a pair see the same examples, so their difference cancels the example difficulty
-        exs = [draw() for _ in range(args.examples)]
-        jobs = [(m, e) for m in range(len(st)) for e in exs]
-        L = nll(eng, theta[None], jobs, st.reshape(len(st), -1))
-        fork_info = ""
-        if forks:
-            ks = [draw_fork() for _ in range(args.fork_examples)]
-            lp = fork_logps(st.reshape(len(st), -1), [(m, k) for m in range(len(st)) for k in ks])
-            r = ref[np.tile(ks, len(st))]
-            mg = ((lp[:, 0] - r[:, 0]) - (lp[:, 1] - r[:, 1])).reshape(len(st), len(ks))
-            F = np.logaddexp(0.0, -args.beta * mg).mean(axis=1)
-            fork_info = f", fork {F.mean():.4f} (margin {mg.mean():+.2f})"
-            L = L + args.w_fork * F
-        d0 = es.update(L)
-        drift = float(np.sqrt(np.mean(es.theta ** 2)))
-        print(f"step {step:5d}: train {L.mean():.5f} (population mean){fork_info}, |dL| {d0:.2e},"
-              f" mean |dL| {np.mean(np.abs(L[0::2] - L[1::2])):.2e}, drift {drift:.3f} head RMS, {time.time() - t0:.1f} s",
-              file=sys.stderr)
+        if opt:
+            info = grad_step()
+        else:
+            # the members' states straight from the noise: s0 + scale * (z +- sigma * eps)
+            d = es.noise() * (args.sigma * scale[:, None, None])
+            base = s0 + scale[:, None, None] * es.theta
+            st = np.empty((2 * args.pairs,) + s0.shape, dtype=np.float32)
+            np.add(base, d, out=st[0::2])
+            np.subtract(base, d, out=st[1::2])
+            # both members of a pair see the same examples, so their difference cancels the example difficulty
+            exs = [draw() for _ in range(args.examples)]
+            jobs = [(m, e) for m in range(len(st)) for e in exs]
+            L = nll(eng, theta[None], jobs, st.reshape(len(st), -1))
+            fork_info = ""
+            if forks:
+                ks = [draw_fork() for _ in range(args.fork_examples)]
+                lp = fork_logps(st.reshape(len(st), -1), [(m, k) for m in range(len(st)) for k in ks])
+                r = ref[np.tile(ks, len(st))]
+                mg = ((lp[:, 0] - r[:, 0]) - (lp[:, 1] - r[:, 1])).reshape(len(st), len(ks))
+                F = np.logaddexp(0.0, -args.beta * mg).mean(axis=1)
+                fork_info = f", fork {F.mean():.4f} (margin {mg.mean():+.2f})"
+                L = L + args.w_fork * F
+            d0 = es.update(L)
+            info = (f"train {L.mean():.5f} (population mean){fork_info}, |dL| {d0:.2e},"
+                    f" mean |dL| {np.mean(np.abs(L[0::2] - L[1::2])):.2e}")
+        drift = float(np.sqrt(np.mean(cur() ** 2)))
+        print(f"step {step:5d}: {info}, drift {drift:.3f} head RMS, {time.time() - t0:.1f} s", file=sys.stderr)
         if step % args.eval_every == 0 or step == args.steps:
-            score, vl = evaluate(es.theta, step)
+            score, vl = evaluate(cur(), step)
             meta = {"step": step, "val_loss": vl, "val_score": score}
             if score < best:
                 best = score
-                save(args.out, es.theta, meta)
-            save(args.out + ".last", es.theta, meta)
+                save(args.out, cur(), meta)
+            save(args.out + ".last", cur(), meta)
             if args.keep_evals:
-                save(f"{args.out}.step{step}", es.theta, meta)
+                save(f"{args.out}.step{step}", cur(), meta)
             print(f"step {step:5d}: val {vl:.5f}, score {score:.5f} (best {best:.5f})", file=sys.stderr)
-
 
 if __name__ == "__main__":
     main()
