@@ -574,6 +574,10 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, 
     }
 }
 
+SP_API void sp_set_grad_ckpt(sp_ctx * c, int32_t n_layers) {
+    llama_set_state_grad_ckpt(c->ctx, n_layers);
+}
+
 SP_API int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_idx, int32_t n_jobs,
                              const int32_t * post, const int64_t * post_off, const int32_t * post_len,
                              const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,

@@ -19,7 +19,9 @@ of the model, before the first token of the prompt; s0 is zero then, so the scal
 --opt grad (with --no-soft-prompt) replaces ES by the exact gradient (backpropagation through the model, llama.cpp's
 state-gradient mode) and Adam on the same parameters and loss: every step is one backward pass per example and per fork
 response, each sequence (prompt + response, at most --max-len tokens; longer responses are cut) in one ubatch, so -b must
-be at least --max-len. The ES options (--pairs, --sigma, --rank, --shaping) are not used; --lr is the Adam step.
+be at least --max-len. With gradient checkpointing (--ckpt layers per segment) a 900-token sequence takes ~6 GB of GPU
+memory besides the model, ~10% more time. The ES options (--pairs, --sigma, --rank, --shaping) are not used; --lr is the
+Adam step.
 """
 
 from __future__ import annotations
@@ -62,8 +64,10 @@ def main():
                     help="no prefix: tune the initial state before the prompt (from the state of --init-file, if any)")
     ap.add_argument("--opt", choices=["es", "grad"], default="es",
                     help="es: antithetic ES; grad: exact gradients (needs --no-soft-prompt) and Adam")
-    ap.add_argument("--max-len", type=int, default=640,
+    ap.add_argument("--max-len", type=int, default=1024,
                     help="--opt grad: prompt + response tokens per sequence, longer responses are cut (GPU memory)")
+    ap.add_argument("--ckpt", type=int, default=4,
+                    help="--opt grad: gradient checkpointing, layers per segment (0: off, ~16 MB of GPU memory per token)")
     rollout.add_sampling_args(ap)
     rewards.add_reward_args(ap)
     args = ap.parse_args()
@@ -76,6 +80,8 @@ def main():
     if args.no_soft_prompt:
         args.init_file, args.init_text, args.before, args.after = None, "", "", ""
     eng, theta, tpl = setup(args, n_seq=args.par if args.opt == "grad" else max(args.par, 2 * args.pairs))
+    if args.opt == "grad":
+        eng.set_grad_ckpt(args.ckpt)
     args.init_file = init_file
     if eng.n_state == 0 or eng.n_state % (HEAD * HEAD):
         sys.exit(f"the model has {eng.n_state} recurrent state values, not a stack of {HEAD} x {HEAD} matrices")

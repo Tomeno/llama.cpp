@@ -62,6 +62,7 @@ def _load_lib(path: str) -> ctypes.CDLL:
     lib.sp_token_embeddings.argtypes = [ctypes.c_void_p, _i32p, ctypes.c_int32, _f32p]
     lib.sp_score.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, _i32p, ctypes.c_int32,
                              _i32p, _i64p, _i32p, _i32p, _i64p, _i32p, ctypes.c_float, _f32p]
+    lib.sp_set_grad_ckpt.argtypes = [ctypes.c_void_p, ctypes.c_int32]
     lib.sp_state_grad.argtypes = [ctypes.c_void_p, _f32p, _i32p, ctypes.c_int32, _i32p, _i64p, _i32p, _i32p, _i64p, _i32p,
                                   _f32p, ctypes.c_float, _f32p, _f32p]
     lib.sp_generate.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, ctypes.c_int32,
@@ -200,6 +201,10 @@ class Engine:
                                       _ptr(pf, _i32p), _ptr(po, _i64p), _ptr(pl, _i32p),
                                       _ptr(rf, _i32p), _ptr(ro, _i64p), _ptr(rl, _i32p), float(temp), _ptr(out, _f32p)))
         return [out[o:o + n] for o, n in zip(ro, rl)]
+
+    def set_grad_ckpt(self, n_layers: int):
+        """state_grad with gradient checkpointing in segments of n_layers layers (0: off): less GPU memory"""
+        self.lib.sp_set_grad_ckpt(self.ctx, n_layers)
 
     def state_grad(self, states: np.ndarray, state_idx: Sequence[int], posts: Sequence[np.ndarray], resps: Sequence[np.ndarray],
                    weights: Sequence[np.ndarray], temp: float = 1.0) -> tuple[list[np.ndarray], np.ndarray]:
