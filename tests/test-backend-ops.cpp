@@ -5335,6 +5335,49 @@ struct test_rwkv_wkv7_back : public test_case {
     }
 };
 
+// GGML_OP_RWKV7 (fused RWKV7 layer parts), and with back = true its GGML_OP_RWKV7_BACK for a random gradient
+struct test_rwkv7 : public test_case {
+    const ggml_rwkv7_op op;
+    const bool back;
+    const int64_t head_count;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR5(op, back, head_count, n_seq_tokens, n_seqs);
+    }
+
+    test_rwkv7(ggml_rwkv7_op op = GGML_RWKV7_OP_LERP, bool back = false, int64_t head_count = 2, int64_t n_seq_tokens = 3,
+            int64_t n_seqs = 2)
+        : op(op), back(back), head_count(head_count), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t N = 64, C = N*head_count, T = n_seq_tokens*n_seqs;
+        auto act = [&]() { return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T); };
+        auto wgt = [&]() { return ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C); };
+        ggml_tensor * out = nullptr;
+        switch (op) {
+            case GGML_RWKV7_OP_LERP: {
+                ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_seq_tokens, n_seqs);
+                ggml_tensor * ts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, 2, n_seqs); // strided shift as in the model
+                ggml_tensor * sh = ggml_view_3d(ctx, ts, C, 1, n_seqs, ts->nb[1], ts->nb[2], C*sizeof(float));
+                out = ggml_rwkv7_lerp(ctx, x, sh, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, 6));
+            } break;
+            case GGML_RWKV7_OP_KKA:   out = ggml_rwkv7_kka(ctx, act(), act(), wgt(), wgt(), wgt(), N); break;
+            case GGML_RWKV7_OP_VRES:  out = ggml_rwkv7_vres(ctx, act(), act(), act(), wgt()); break;
+            case GGML_RWKV7_OP_DECAY: out = ggml_rwkv7_decay(ctx, act(), wgt()); break;
+            case GGML_RWKV7_OP_OUT:
+                out = ggml_rwkv7_out(ctx, act(), act(), act(), act(), act(), wgt(), wgt(), wgt(), N, 64e-5f);
+                break;
+            default: GGML_ABORT("fatal error");
+        }
+        if (!back) {
+            return out;
+        }
+        return ggml_rwkv7_back(ctx, out, ggml_new_tensor(ctx, GGML_TYPE_F32, 4, out->ne));
+    }
+};
+
 // GGML_OP_NORM / GGML_OP_L2_NORM gradients (weighted by a random tensor: the sum of a normalized row is constant)
 struct test_norm_grad : public test_case {
     const bool l2;
@@ -11115,6 +11158,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 128, 4));
     test_cases.emplace_back(new test_rwkv_wkv7_back(4, 64, 37, 2));
     test_cases.emplace_back(new test_rwkv_wkv7_back(32, 64, 128, 1));
+    for (int op = 0; op < GGML_RWKV7_OP_COUNT; ++op) {
+        for (bool back : { false, true }) {
+            test_cases.emplace_back(new test_rwkv7((ggml_rwkv7_op) op, back));
+            test_cases.emplace_back(new test_rwkv7((ggml_rwkv7_op) op, back, 40, 37, 3));
+        }
+    }
     test_cases.emplace_back(new test_norm_grad(false));
     test_cases.emplace_back(new test_norm_grad(true));
 

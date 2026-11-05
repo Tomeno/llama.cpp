@@ -12054,6 +12054,193 @@ void ggml_compute_forward_rwkv_wkv7_back(
     ggml_compute_forward_rwkv_wkv7_back_f32(params, dst);
 }
 
+// ggml_compute_forward_rwkv7
+
+static inline float rwkv7_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// rows of C (one token, or one token and lerp) split between the threads
+static void ggml_compute_forward_rwkv7_f32(const ggml_compute_params * params, ggml_tensor * dst, bool back) {
+    const ggml_rwkv7_op op = ggml_get_rwkv7_op(dst);
+    const ggml_tensor * fwd_src[GGML_MAX_SRC] = {};
+    for (int i = 0; i < GGML_MAX_SRC - 1; ++i) {
+        fwd_src[i] = dst->src[i];
+    }
+    const int64_t C  = fwd_src[0]->ne[0];
+    const int64_t T  = ggml_nelements(fwd_src[0]) / C;
+    const int     N  = ggml_get_op_params_i32(dst, 1);
+    const float   eps = ggml_get_op_params_f32(dst, 2);
+    const float * gr = back ? (const float *) dst->src[GGML_MAX_SRC - 1]->data : nullptr;
+    float * d = (float *) dst->data;
+    auto F = [&](int i) { return fwd_src[i] ? (const float *) fwd_src[i]->data : nullptr; };
+
+    const int64_t r0 = (T * params->ith) / params->nth;
+    const int64_t r1 = (T * (params->ith + 1)) / params->nth;
+
+    switch (op) {
+        case GGML_RWKV7_OP_LERP: {
+            const ggml_tensor * sh = fwd_src[1];
+            const int64_t Ts = fwd_src[0]->ne[1];
+            const int64_t K  = ggml_nelements(fwd_src[2]) / C;
+            const float * x = F(0), * mu = F(2);
+            auto prev = [&](int64_t t, int64_t c) {
+                const int64_t s = t / Ts;
+                return t % Ts ? x[(t - 1)*C + c] : *(const float *) ((const char *) sh->data + s*sh->nb[2] + c*sizeof(float));
+            };
+            for (int64_t t = r0; t < r1; ++t) {
+                if (!back) {
+                    for (int64_t k = 0; k < K; ++k) {
+                        for (int64_t c = 0; c < C; ++c) {
+                            const float xc = x[t*C + c];
+                            d[(k*T + t)*C + c] = xc + (prev(t, c) - xc) * mu[k*C + c];
+                        }
+                    }
+                    continue;
+                }
+                const bool last = (t + 1) % Ts == 0;
+                for (int64_t c = 0; c < C; ++c) {
+                    float dx = 0.0f, ds = 0.0f;
+                    for (int64_t k = 0; k < K; ++k) {
+                        const float m = mu[k*C + c];
+                        const float g = gr[(k*T + t)*C + c];
+                        dx += g * (1.0f - m);
+                        ds += g * m; // to the previous token (or the shift)
+                        if (!last) {
+                            dx += gr[(k*T + t + 1)*C + c] * m;
+                        }
+                    }
+                    d[t*C + c] = dx;
+                    if (t % Ts == 0) {
+                        d[T*C + (t / Ts)*C + c] = ds;
+                    }
+                }
+            }
+        } break;
+        case GGML_RWKV7_OP_KKA: {
+            const float * k = F(0), * a = F(1), * a0 = F(2), * k_k = F(3), * k_a = F(4);
+            for (int64_t t = r0; t < r1; ++t) {
+                for (int64_t h = 0; h < C / N; ++h) {
+                    const int64_t o = t*C + h*N;
+                    float q = 0.0f;
+                    for (int j = 0; j < N; ++j) {
+                        const float u = k[o + j] * k_k[h*N + j];
+                        q += u*u;
+                    }
+                    const float inv = 1.0f / fmaxf(sqrtf(q), 1e-12f);
+                    float dot = 0.0f; // back: sum(dkk * kk)
+                    for (int j = 0; j < N && back; ++j) {
+                        const int64_t c = h*N + j;
+                        const float kk = k[o + j] * k_k[c] * inv;
+                        const float av = rwkv7_sigmoid(a[o + j] + a0[c]);
+                        const float dkk = -gr[T*C + o + j] + gr[2*T*C + o + j] * av;
+                        dot += dkk * kk;
+                    }
+                    for (int j = 0; j < N; ++j) {
+                        const int64_t c = h*N + j;
+                        const float kv = k[o + j];
+                        const float kk = kv * k_k[c] * inv;
+                        const float av = rwkv7_sigmoid(a[o + j] + a0[c]);
+                        if (!back) {
+                            d[o + j]         = kv * (1.0f + k_a[c] * (av - 1.0f));
+                            d[T*C + o + j]   = -kk;
+                            d[2*T*C + o + j] = kk * av;
+                        } else {
+                            const float gk = gr[o + j], gb = gr[2*T*C + o + j];
+                            const float dkk = -gr[T*C + o + j] + gb * av;
+                            const float du  = (dkk - kk * dot) * inv;
+                            d[o + j]       = gk * (1.0f + k_a[c] * (av - 1.0f)) + du * k_k[c];
+                            d[T*C + o + j] = (gk * kv * k_a[c] + gb * kk) * av * (1.0f - av);
+                        }
+                    }
+                }
+            }
+        } break;
+        case GGML_RWKV7_OP_VRES: {
+            const float * v = F(0), * vf = F(1), * v12 = F(2), * v0 = F(3);
+            for (int64_t t = r0; t < r1; ++t) {
+                for (int64_t c = 0; c < C; ++c) {
+                    const int64_t i = t*C + c;
+                    const float gate = rwkv7_sigmoid(v12[i] + v0[c]);
+                    if (!back) {
+                        d[i] = v[i] + (vf[i] - v[i]) * gate;
+                    } else {
+                        d[i]         = gr[i] * (1.0f - gate);
+                        d[T*C + i]   = gr[i] * gate;
+                        d[2*T*C + i] = gr[i] * (vf[i] - v[i]) * gate * (1.0f - gate);
+                    }
+                }
+            }
+        } break;
+        case GGML_RWKV7_OP_DECAY: {
+            const float * w = F(0), * w0 = F(1);
+            for (int64_t t = r0; t < r1; ++t) {
+                for (int64_t c = 0; c < C; ++c) {
+                    const int64_t i = t*C + c;
+                    const float sg = rwkv7_sigmoid(w[i] + w0[c]);
+                    const float e  = expf(-0.606531f * sg);
+                    d[i] = back ? gr[i] * e * -0.606531f * sg * (1.0f - sg) : e;
+                }
+            }
+        } break;
+        case GGML_RWKV7_OP_OUT: {
+            const float * y = F(0), * r = F(1), * k = F(2), * v = F(3), * g = F(4), * lw = F(5), * lb = F(6), * rk = F(7);
+            for (int64_t t = r0; t < r1; ++t) {
+                for (int64_t h = 0; h < C / N; ++h) {
+                    const int64_t o = t*C + h*N;
+                    float mean = 0.0f, var = 0.0f, bonus = 0.0f;
+                    for (int j = 0; j < N; ++j) {
+                        mean  += y[o + j];
+                        bonus += r[o + j] * k[o + j] * rk[h*N + j];
+                    }
+                    mean /= N;
+                    for (int j = 0; j < N; ++j) {
+                        var += (y[o + j] - mean) * (y[o + j] - mean);
+                    }
+                    const float rstd = 1.0f / sqrtf(var / N + eps);
+                    if (!back) {
+                        for (int j = 0; j < N; ++j) {
+                            const int64_t c = h*N + j;
+                            const float z = (y[o + j] - mean) * rstd * lw[c] + lb[c] + bonus * v[o + j];
+                            d[o + j] = g ? z * g[o + j] : z;
+                        }
+                        continue;
+                    }
+                    float s_dn = 0.0f, s_dnn = 0.0f, s_dzv = 0.0f;
+                    for (int j = 0; j < N; ++j) {
+                        const int64_t c = h*N + j;
+                        const float dz = g ? gr[o + j] * g[o + j] : gr[o + j];
+                        const float yn = (y[o + j] - mean) * rstd;
+                        s_dn  += dz * lw[c];
+                        s_dnn += dz * lw[c] * yn;
+                        s_dzv += dz * v[o + j];
+                    }
+                    for (int j = 0; j < N; ++j) {
+                        const int64_t c = h*N + j;
+                        const float dz = g ? gr[o + j] * g[o + j] : gr[o + j];
+                        const float yn = (y[o + j] - mean) * rstd;
+                        d[o + j]         = (dz * lw[c] - s_dn / N - yn * s_dnn / N) * rstd;
+                        d[T*C + o + j]   = s_dzv * k[o + j] * rk[c];
+                        d[2*T*C + o + j] = s_dzv * r[o + j] * rk[c];
+                        d[3*T*C + o + j] = dz * bonus;
+                        d[4*T*C + o + j] = g ? gr[o + j] * (yn * lw[c] + lb[c] + bonus * v[o + j]) : 0.0f;
+                    }
+                }
+            }
+        } break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
+void ggml_compute_forward_rwkv7(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_rwkv7_f32(params, dst, false);
+}
+
+void ggml_compute_forward_rwkv7_back(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_rwkv7_f32(params, dst, true);
+}
+
 // ggml_compute_forward_map_custom1
 
 void ggml_compute_forward_map_custom1(

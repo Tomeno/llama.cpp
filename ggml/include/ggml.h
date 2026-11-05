@@ -580,6 +580,8 @@ extern "C" {
         GGML_OP_GATED_LINEAR_ATTN,
         GGML_OP_RWKV_WKV7,
         GGML_OP_RWKV_WKV7_BACK,
+        GGML_OP_RWKV7,
+        GGML_OP_RWKV7_BACK,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
@@ -631,6 +633,17 @@ extern "C" {
         GGML_UNARY_OP_TRUNC,
 
         GGML_UNARY_OP_COUNT,
+    };
+
+    // fused element-wise parts of an RWKV7 layer (GGML_OP_RWKV7)
+    enum ggml_rwkv7_op {
+        GGML_RWKV7_OP_LERP,   // token shift + lerps
+        GGML_RWKV7_OP_KKA,    // kk, a, the new k and the wkv7 a / b inputs
+        GGML_RWKV7_OP_VRES,   // value residual mix
+        GGML_RWKV7_OP_DECAY,  // decay w
+        GGML_RWKV7_OP_OUT,    // group norm, bonus and gate of the wkv7 output
+
+        GGML_RWKV7_OP_COUNT,
     };
 
     enum ggml_glu_op {
@@ -2633,6 +2646,65 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * state,
+            struct ggml_tensor  * grad);
+
+    // fused RWKV7 layer parts; the backward pass of every one is GGML_OP_RWKV7_BACK (no gradients for the weights)
+    //
+    // x [C, n_seq_tokens, n_seqs], shift [C, 1, n_seqs] (strided), mu [C, K] -> [C, n_seq_tokens, n_seqs, K]:
+    //   x + (prev - x) * mu[:, k], prev the previous token of the sequence, shift before the first
+    GGML_API struct ggml_tensor * ggml_rwkv7_lerp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * shift,
+            struct ggml_tensor  * mu);
+
+    // k, a [C, T], a0, k_k, k_a [C], heads of head_size -> [C, T, 3]: new k, -kk, kk*a, with
+    //   kk = l2_norm(k * k_k) per head, a = sigmoid(a + a0), new k = k * (1 + k_a * (a - 1))
+    GGML_API struct ggml_tensor * ggml_rwkv7_kka(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * a0,
+            struct ggml_tensor  * k_k,
+            struct ggml_tensor  * k_a,
+            int                   head_size);
+
+    // v, v_first, v12 [C, T], v0 [C] -> v + (v_first - v) * sigmoid(v12 + v0)
+    GGML_API struct ggml_tensor * ggml_rwkv7_vres(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * v_first,
+            struct ggml_tensor  * v12,
+            struct ggml_tensor  * v0);
+
+    // w [C, T], w0 [C] -> exp(-0.606531 * sigmoid(w + w0))
+    GGML_API struct ggml_tensor * ggml_rwkv7_decay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * w0);
+
+    // y, r, k, v [C, T], g [C, T] or NULL, ln_w, ln_b, r_k [C] -> per head of head_size:
+    //   (norm(y) * ln_w + ln_b + sum(r * k * r_k) * v) * g
+    GGML_API struct ggml_tensor * ggml_rwkv7_out(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * y,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * ln_w,
+            struct ggml_tensor  * ln_b,
+            struct ggml_tensor  * r_k,
+            int                   head_size,
+            float                 eps);
+
+    GGML_API enum ggml_rwkv7_op ggml_get_rwkv7_op(const struct ggml_tensor * tensor);
+
+    // the gradients of the inputs of an RWKV7 node fwd for the gradient grad of its result, packed:
+    // LERP [dx, dshift], KKA [dk, da], VRES [dv, dv_first, dv12], DECAY [dw], OUT [dy, dr, dk, dv, dg]
+    GGML_API struct ggml_tensor * ggml_rwkv7_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * fwd,
             struct ggml_tensor  * grad);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix

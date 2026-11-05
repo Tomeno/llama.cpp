@@ -1090,6 +1090,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
     "RWKV_WKV7_BACK",
+    "RWKV7",
+    "RWKV7_BACK",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
@@ -1114,7 +1116,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1207,6 +1209,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "rwkv_wkv7_back(r, w, k, v, a, b, s, grad)",
+    "rwkv7(x)",
+    "rwkv7_back(x)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
@@ -1231,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6030,6 +6034,139 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     return result;
 }
 
+// ggml_rwkv7 (fused RWKV7 layer parts)
+
+enum ggml_rwkv7_op ggml_get_rwkv7_op(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->op == GGML_OP_RWKV7 || tensor->op == GGML_OP_RWKV7_BACK);
+    return (enum ggml_rwkv7_op) ggml_get_op_params_i32(tensor, 0);
+}
+
+static struct ggml_tensor * ggml_rwkv7_impl(
+        struct ggml_context * ctx,
+        enum ggml_rwkv7_op    op,
+        const int64_t         ne[4],
+        struct ggml_tensor ** srcs,
+        int                   n_srcs,
+        int32_t               head_size,
+        float                 eps) {
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    ggml_set_op_params_i32(result, 0, op);
+    ggml_set_op_params_i32(result, 1, head_size);
+    ggml_set_op_params_f32(result, 2, eps);
+    result->op = GGML_OP_RWKV7;
+    for (int i = 0; i < n_srcs; ++i) {
+        GGML_ASSERT(!srcs[i] || srcs[i]->type == GGML_TYPE_F32);
+        result->src[i] = srcs[i];
+    }
+    return result;
+}
+
+struct ggml_tensor * ggml_rwkv7_lerp(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * shift,
+        struct ggml_tensor  * mu) {
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(mu));
+    GGML_ASSERT(shift->ne[0] == x->ne[0] && shift->ne[1] == 1 && shift->ne[2] == x->ne[2] && shift->nb[0] == sizeof(float));
+    GGML_ASSERT(mu->ne[0] == x->ne[0] && ggml_nelements(mu) % mu->ne[0] == 0);
+    const int64_t ne[4] = { x->ne[0], x->ne[1], x->ne[2], ggml_nelements(mu) / mu->ne[0] };
+    struct ggml_tensor * srcs[3] = { x, shift, mu };
+    return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_LERP, ne, srcs, 3, 0, 0.0f);
+}
+
+struct ggml_tensor * ggml_rwkv7_kka(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * a0,
+        struct ggml_tensor  * k_k,
+        struct ggml_tensor  * k_a,
+        int                   head_size) {
+    const int64_t C = k->ne[0];
+    const int64_t T = ggml_nelements(k) / C;
+    GGML_ASSERT(ggml_is_contiguous(k) && ggml_is_contiguous(a) && ggml_nelements(a) == C*T && C % head_size == 0);
+    GGML_ASSERT(ggml_nelements(a0) == C && ggml_nelements(k_k) == C && ggml_nelements(k_a) == C);
+    const int64_t ne[4] = { C, T, 3, 1 };
+    struct ggml_tensor * srcs[5] = { k, a, a0, k_k, k_a };
+    return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_KKA, ne, srcs, 5, head_size, 0.0f);
+}
+
+struct ggml_tensor * ggml_rwkv7_vres(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * v_first,
+        struct ggml_tensor  * v12,
+        struct ggml_tensor  * v0) {
+    const int64_t C = v->ne[0];
+    const int64_t T = ggml_nelements(v) / C;
+    GGML_ASSERT(ggml_is_contiguous(v) && ggml_is_contiguous(v_first) && ggml_is_contiguous(v12));
+    GGML_ASSERT(ggml_nelements(v_first) == C*T && ggml_nelements(v12) == C*T && ggml_nelements(v0) == C);
+    const int64_t ne[4] = { C, T, 1, 1 };
+    struct ggml_tensor * srcs[4] = { v, v_first, v12, v0 };
+    return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_VRES, ne, srcs, 4, 0, 0.0f);
+}
+
+struct ggml_tensor * ggml_rwkv7_decay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * w0) {
+    const int64_t C = w->ne[0];
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_nelements(w0) == C);
+    const int64_t ne[4] = { C, ggml_nelements(w) / C, 1, 1 };
+    struct ggml_tensor * srcs[2] = { w, w0 };
+    return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_DECAY, ne, srcs, 2, 0, 0.0f);
+}
+
+struct ggml_tensor * ggml_rwkv7_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * y,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * ln_w,
+        struct ggml_tensor  * ln_b,
+        struct ggml_tensor  * r_k,
+        int                   head_size,
+        float                 eps) {
+    const int64_t C = y->ne[0];
+    const int64_t T = ggml_nelements(y) / C;
+    struct ggml_tensor * srcs[8] = { y, r, k, v, g, ln_w, ln_b, r_k };
+    for (int i = 0; i < 5; ++i) {
+        GGML_ASSERT(!srcs[i] || (ggml_is_contiguous(srcs[i]) && ggml_nelements(srcs[i]) == C*T));
+    }
+    GGML_ASSERT(ggml_nelements(ln_w) == C && ggml_nelements(ln_b) == C && ggml_nelements(r_k) == C && C % head_size == 0);
+    const int64_t ne[4] = { C, T, 1, 1 };
+    return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_OUT, ne, srcs, 8, head_size, eps);
+}
+
+// the gradients of the inputs of an RWKV7 node for the gradient of its result, packed (see the CPU / CUDA kernels):
+// LERP [dx, dshift], KKA [dk, da], VRES [dv, dv_first, dv12], DECAY [dw], OUT [dy, dr, dk, dv, dg]
+struct ggml_tensor * ggml_rwkv7_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * fwd,
+        struct ggml_tensor  * grad) {
+    GGML_ASSERT(ggml_is_contiguous(grad) && ggml_are_same_shape(grad, fwd));
+    const int64_t C = fwd->ne[0];
+    int64_t ne[4] = { C, 1, 1, 1 };
+    switch (ggml_get_rwkv7_op(fwd)) {
+        case GGML_RWKV7_OP_LERP:  ne[1] = fwd->ne[1]*fwd->ne[2] + fwd->ne[2]; break;
+        case GGML_RWKV7_OP_KKA:   ne[1] = fwd->ne[1]; ne[2] = 2; break;
+        case GGML_RWKV7_OP_VRES:  ne[1] = fwd->ne[1]; ne[2] = 3; break;
+        case GGML_RWKV7_OP_DECAY: ne[1] = fwd->ne[1]; break;
+        case GGML_RWKV7_OP_OUT:   ne[1] = fwd->ne[1]; ne[2] = 5; break;
+        default: GGML_ABORT("fatal error");
+    }
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    memcpy(result->op_params, fwd->op_params, sizeof(fwd->op_params));
+    result->op = GGML_OP_RWKV7_BACK;
+    for (int i = 0; i < GGML_MAX_SRC - 1; ++i) {
+        result->src[i] = fwd->src[i];
+    }
+    result->src[GGML_MAX_SRC - 1] = grad;
+    return result;
+}
+
 // ggml_rwkv_wkv7_back
 
 struct ggml_tensor * ggml_rwkv_wkv7_back(
@@ -7467,6 +7604,37 @@ static void ggml_compute_backward(
                 struct ggml_tensor * nrm = ggml_clamp(ctx, ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, src0))), eps, INFINITY);
                 struct ggml_tensor * g   = ggml_sub(ctx, grad, ggml_mul(ctx, tensor, ggml_sum_rows(ctx, ggml_mul(ctx, grad, tensor))));
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, g, nrm));
+            }
+        } break;
+        case GGML_OP_RWKV7: {
+            // (source, offset in the packed gradients in floats) per input with a gradient; the weights have none
+            struct ggml_tensor * back = ggml_rwkv7_back(ctx, tensor, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad));
+            const int64_t n = ggml_nelements(src0);
+            int64_t off[GGML_MAX_SRC];
+            int n_grad = 0;
+            switch (ggml_get_rwkv7_op(tensor)) {
+                case GGML_RWKV7_OP_LERP:  n_grad = 2; break;
+                case GGML_RWKV7_OP_KKA:   n_grad = 2; break;
+                case GGML_RWKV7_OP_VRES:  n_grad = 3; break;
+                case GGML_RWKV7_OP_DECAY: n_grad = 1; break;
+                case GGML_RWKV7_OP_OUT:   n_grad = 5; break;
+                default: GGML_ABORT("fatal error");
+            }
+            for (int j = 0; j < n_grad; ++j) {
+                off[j] = j*n;
+            }
+            for (int j = 0; j < GGML_MAX_SRC - 1; ++j) {
+                struct ggml_tensor * src = tensor->src[j];
+                if (!src) {
+                    continue;
+                }
+                const size_t isrc = ggml_hash_find(hash_set, src);
+                if (isrc == GGML_HASHSET_FULL || !ggml_bitset_get(hash_set->used, isrc) || !grads_needed[isrc]) {
+                    continue;
+                }
+                GGML_ASSERT(j < n_grad && "backward pass for the RWKV7 weights not implemented");
+                struct ggml_tensor * g = ggml_view_1d(ctx, back, ggml_nelements(src), off[j]*sizeof(float));
+                ggml_add_or_set(ctx, cgraph, isrc, ggml_reshape(ctx, g, src));
             }
         } break;
         case GGML_OP_RWKV_WKV7: {

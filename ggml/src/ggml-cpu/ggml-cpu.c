@@ -2085,6 +2085,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_rwkv_wkv7_back(params, tensor);
             } break;
+        case GGML_OP_RWKV7:
+            {
+                ggml_compute_forward_rwkv7(params, tensor);
+            } break;
+        case GGML_OP_RWKV7_BACK:
+            {
+                ggml_compute_forward_rwkv7_back(params, tensor);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 ggml_compute_forward_solve_tri(params, tensor);
@@ -2440,6 +2448,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
         case GGML_OP_RWKV_WKV7_BACK:
+        case GGML_OP_RWKV7:
+        case GGML_OP_RWKV7_BACK:
             {
                 n_tasks = n_threads;
             } break;
