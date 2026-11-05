@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -797,6 +798,13 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
             std::vector<llama_token> last(ns, -1);
             std::vector<bool>        active(ns, true);
 
+            // the memory sequence of each sequence; a recurrent memory splits a batch at every gap in the sequence ids, so
+            // a finished sequence hands its id to the active one with the highest id (the cell is relabeled, not copied)
+            const bool compact = llama_model_is_recurrent(c->model);
+            std::vector<llama_seq_id> mem(ns);
+            std::iota(mem.begin(), mem.end(), 0);
+            int n_act = ns;
+
             auto take = [&](int s, llama_token t) {
                 const int k = w0 + s;
                 out_tok[(size_t) k*max_new + out_len[k]++] = t;
@@ -806,6 +814,19 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                     active[s] = false;
                 } else if (out_len[k] >= max_new) {
                     active[s] = false;
+                }
+                if (!active[s] && compact) {
+                    auto * m = llama_get_memory(c->ctx);
+                    llama_memory_seq_rm(m, mem[s], -1, -1);
+                    --n_act;
+                    for (int u = 0; u < ns; ++u) {
+                        if (active[u] && mem[u] == n_act) {
+                            llama_memory_seq_cp(m, n_act, mem[s], -1, -1);
+                            llama_memory_seq_rm(m, n_act, -1, -1);
+                            mem[u] = mem[s];
+                            break;
+                        }
+                    }
                 }
             };
 
@@ -825,7 +846,22 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                         if (o) {
                             outs.emplace_back(s, (int) items.size());
                         }
-                        items.push_back({ s, pt[i], pos0 + i, o });
+                        items.push_back({ mem[s], pt[i], pos0 + i, o });
+                    }
+                }
+                if (compact) { // increasing ids; outs follows the items
+                    std::vector<int> ord(items.size());
+                    std::iota(ord.begin(), ord.end(), 0);
+                    std::stable_sort(ord.begin(), ord.end(), [&](int x, int y) { return items[x].seq < items[y].seq; });
+                    std::vector<int> at(items.size());
+                    std::vector<sp_item> sorted;
+                    for (size_t k = 0; k < ord.size(); ++k) {
+                        at[ord[k]] = (int) k;
+                        sorted.push_back(items[ord[k]]);
+                    }
+                    items.swap(sorted);
+                    for (auto & o : outs) {
+                        o.second = at[o.second];
                     }
                 }
                 decode_items(c, items);
@@ -850,8 +886,11 @@ SP_API int32_t sp_generate(sp_ctx * c, const float * theta, const float * state,
                 for (int s = 0; s < ns; ++s) {
                     if (active[s]) {
                         seqs.push_back(s);
-                        items.push_back({ s, last[s], pos[s]++, true });
                     }
+                }
+                std::sort(seqs.begin(), seqs.end(), [&](int x, int y) { return mem[x] < mem[y]; });
+                for (int s : seqs) {
+                    items.push_back({ mem[s], last[s], pos[s]++, true });
                 }
                 if (items.empty()) {
                     break;
