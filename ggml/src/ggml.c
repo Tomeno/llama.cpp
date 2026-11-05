@@ -5988,7 +5988,8 @@ struct ggml_tensor * ggml_gated_linear_attn(
 
 // ggml_rwkv_wkv7
 
-struct ggml_tensor * ggml_rwkv_wkv7(
+// inplace: the final state is written over the input state, the result is the output only (op_params[0] = 1)
+static struct ggml_tensor * ggml_rwkv_wkv7_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * r,
         struct ggml_tensor  * w,
@@ -5996,7 +5997,8 @@ struct ggml_tensor * ggml_rwkv_wkv7(
         struct ggml_tensor  * v,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
-        struct ggml_tensor  * state) {
+        struct ggml_tensor  * state,
+        bool                  inplace) {
     GGML_ASSERT(ggml_is_contiguous(r));
     GGML_ASSERT(ggml_is_contiguous(w));
     GGML_ASSERT(ggml_is_contiguous(k));
@@ -6018,9 +6020,10 @@ struct ggml_tensor * ggml_rwkv_wkv7(
         GGML_ASSERT(ggml_nelements(state) == S * S * H * n_seqs);
     }
 
-    // concat output and new_state
-    const int64_t ne[4] = { S * H, n_tokens + S * n_seqs, 1, 1 };
+    // concat output and new_state (in place: the output only)
+    const int64_t ne[4] = { S * H, n_tokens + (inplace ? 0 : S * n_seqs), 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    ggml_set_op_params_i32(result, 0, inplace ? 1 : 0);
 
     result->op     = GGML_OP_RWKV_WKV7;
     result->src[0] = r;
@@ -6032,6 +6035,30 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     result->src[6] = state;
 
     return result;
+}
+
+struct ggml_tensor * ggml_rwkv_wkv7(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * state) {
+    return ggml_rwkv_wkv7_impl(ctx, r, w, k, v, a, b, state, false);
+}
+
+struct ggml_tensor * ggml_rwkv_wkv7_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * state) {
+    return ggml_rwkv_wkv7_impl(ctx, r, w, k, v, a, b, state, true);
 }
 
 // ggml_rwkv7 (fused RWKV7 layer parts)
@@ -7640,6 +7667,7 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_RWKV_WKV7: {
+            GGML_ASSERT(ggml_get_op_params_i32(tensor, 0) == 0 && "no backward pass for ggml_rwkv_wkv7_inplace");
             struct ggml_tensor * back = ggml_rwkv_wkv7_back(ctx, src0, src1, src2, tensor->src[3], tensor->src[4],
                 tensor->src[5], tensor->src[6], ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad));
             const int64_t n_tok = ggml_nelements(src0);

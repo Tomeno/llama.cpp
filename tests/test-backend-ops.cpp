@@ -5281,12 +5281,14 @@ struct test_rwkv_wkv7 : public test_case {
     const int64_t n_seqs;
 
     std::string vars() override {
-        return VARS_TO_STR5(type, head_count, head_size, n_seq_tokens, n_seqs);
+        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, inplace);
     }
 
+    const bool inplace;
+
     test_rwkv_wkv7(ggml_type type = GGML_TYPE_F32,
-            int64_t head_count = 32, int64_t head_size = 64, int64_t n_seq_tokens = 32, int64_t n_seqs = 32)
-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+            int64_t head_count = 32, int64_t head_size = 64, int64_t n_seq_tokens = 32, int64_t n_seqs = 32, bool inplace = false)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), inplace(inplace) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_tokens = n_seq_tokens * n_seqs;
@@ -5300,7 +5302,8 @@ struct test_rwkv_wkv7 : public test_case {
         a = ggml_l2_norm(ctx, a, 1e-7F);
         b = ggml_l2_norm(ctx, b, 1e-7F);
         ggml_tensor * s   = ggml_new_tensor(ctx, type, 2, std::vector<int64_t>{ head_size * head_size * head_count, n_seqs }.data());
-        ggml_tensor * out = ggml_rwkv_wkv7(ctx, r, w, k, v, a, b, s);
+        // in place: the output only (the state is written over s)
+        ggml_tensor * out = inplace ? ggml_rwkv_wkv7_inplace(ctx, r, w, k, v, a, b, s) : ggml_rwkv_wkv7(ctx, r, w, k, v, a, b, s);
         return out;
     }
 };
@@ -11156,6 +11159,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 128, 4));
+    test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 1, 4, true));
+    test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 4, true));
     test_cases.emplace_back(new test_rwkv_wkv7_back(4, 64, 37, 2));
     test_cases.emplace_back(new test_rwkv_wkv7_back(32, 64, 128, 1));
     for (int op = 0; op < GGML_RWKV7_OP_COUNT; ++op) {

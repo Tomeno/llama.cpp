@@ -2635,6 +2635,18 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * state);
 
+    // ggml_rwkv_wkv7 that writes the final state over the input state (e.g. the cache rows of the states, read in place); the
+    // result is the output only [S*H, n_tokens]; no backward pass
+    GGML_API struct ggml_tensor * ggml_rwkv_wkv7_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * state);
+
     // gradient of ggml_rwkv_wkv7: grad has the shape of its result (output gradient, then the final state gradient);
     // the result is [S*H, 6*n_tokens + S*n_seqs]: the gradients of r, w, k, v, a, b and the initial state, in this order
     GGML_API struct ggml_tensor * ggml_rwkv_wkv7_back(

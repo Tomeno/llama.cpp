@@ -1839,8 +1839,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SSM_CONV:
             return has_simdgroup_reduction;
         case GGML_OP_RWKV_WKV6:
-        case GGML_OP_RWKV_WKV7:
             return true;
+        case GGML_OP_RWKV_WKV7:
+            return op->op_params[0] == 0; // not ggml_rwkv_wkv7_inplace
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:

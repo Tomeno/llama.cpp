@@ -11728,7 +11728,8 @@ static void ggml_compute_forward_rwkv_wkv7_f32(
     const int64_t head_size = C / HEADS;
 
     float * dst_data = (float *) dst->data;
-    float * state = ((float *) dst->data) + C * T;
+    // in place (op_params[0]): the final state over the input state
+    float * state = ggml_get_op_params_i32(dst, 0) ? (float *) dst->src[6]->data : ((float *) dst->data) + C * T;
 
     const int ith = params->ith;
     const int nth = params->nth;

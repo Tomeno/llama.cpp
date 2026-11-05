@@ -66,7 +66,7 @@ static __global__ void rwkv_wkv_f32(const int B, const int T, const int C, const
 }
 
 template <int block_size>
-static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, const int H, const float * r, const float * w, const float * k, const float * v, const float * a, const float * b, const float * s, float * dst) {
+static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, const int H, const float * r, const float * w, const float * k, const float * v, const float * a, const float * b, const float * s, float * dst, float * s_out) {
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
 
@@ -135,13 +135,13 @@ static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, cons
 
     #pragma unroll
     for (int i = 0; i < head_size; i++) {
-        dst[T * C + batch_i * state_size + head_i * head_size * head_size + tid * head_size + i] = state[i];
+        s_out[batch_i * state_size + head_i * head_size * head_size + tid * head_size + i] = state[i];
     }
 }
 
 template <int rows_per_block>
 static __global__ void __launch_bounds__(WARP_SIZE * rows_per_block, 2)
-rwkv_wkv7_f32_t1_warp_row(const int T, const int C, const int H, const float * r, const float * w, const float * k, const float * v, const float * a, const float * b, const float * s, float * dst) {
+rwkv_wkv7_f32_t1_warp_row(const int T, const int C, const int H, const float * r, const float * w, const float * k, const float * v, const float * a, const float * b, const float * s, float * dst, float * s_out) {
     constexpr int head_size = CUDA_WKV_BLOCK_SIZE;
     constexpr int half_head = head_size / 2;
 
@@ -182,8 +182,8 @@ rwkv_wkv7_f32_t1_warp_row(const int T, const int C, const int H, const float * r
     const float st1 = s1 * _w[lane + half_head] + _k[lane + half_head] * vt + sa * _b[lane + half_head];
     const float y   = warp_reduce_sum(st0 * _r[lane] + st1 * _r[lane + half_head]);
 
-    dst[T * C + state_base + lane]             = st0;
-    dst[T * C + state_base + lane + half_head] = st1;
+    s_out[state_base + lane]             = st0;
+    s_out[state_base + lane + half_head] = st1;
 
     if (lane == 0) {
         dst[t] = y;
@@ -233,6 +233,8 @@ void ggml_cuda_op_rwkv_wkv7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t H = dst->src[0]->ne[1];
 
     float * dst_d = (float *)dst->data;
+    // in place (op_params[0]): the final state over the input state
+    float * s_out = ggml_get_op_params_i32(dst, 0) ? (float *) dst->src[6]->data : dst_d + T * C;
 
     cudaStream_t stream = ctx.stream();
 
@@ -242,11 +244,11 @@ void ggml_cuda_op_rwkv_wkv7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     if (T / B == 1 && C / H == CUDA_WKV_BLOCK_SIZE) {
         constexpr int rows_per_block = 4;
-        rwkv_wkv7_f32_t1_warp_row<rows_per_block><<<dim3(B * H, CUDA_WKV_BLOCK_SIZE / rows_per_block), dim3(WARP_SIZE, rows_per_block), 0, stream>>>(T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d);
+        rwkv_wkv7_f32_t1_warp_row<rows_per_block><<<dim3(B * H, CUDA_WKV_BLOCK_SIZE / rows_per_block), dim3(WARP_SIZE, rows_per_block), 0, stream>>>(T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d, s_out);
     } else if (C / H == CUDA_WKV_BLOCK_SIZE) {
-        rwkv_wkv7_f32<CUDA_WKV_BLOCK_SIZE><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d);
+        rwkv_wkv7_f32<CUDA_WKV_BLOCK_SIZE><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d, s_out);
     } else {
-        rwkv_wkv7_f32<CUDA_WKV_BLOCK_SIZE * 2><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d);
+        rwkv_wkv7_f32<CUDA_WKV_BLOCK_SIZE * 2><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d, s_out);
     }
 }
 

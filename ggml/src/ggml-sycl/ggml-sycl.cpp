@@ -7641,8 +7641,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             return true;
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_TIMESTEP_EMBEDDING:
-        case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
+            return op->op_params[0] == 0; // not ggml_rwkv_wkv7_inplace
+        case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_OPT_STEP_ADAMW:

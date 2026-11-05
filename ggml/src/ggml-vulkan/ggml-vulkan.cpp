@@ -15994,8 +15994,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_POOL_2D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_RWKV_WKV6:
-        case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c
+        case GGML_OP_RWKV_WKV7:
+            return op->op_params[0] == 0; // not ggml_rwkv_wkv7_inplace
         case GGML_OP_GATED_LINEAR_ATTN:
             // the shader block size is hardcoded to head_size 64
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
