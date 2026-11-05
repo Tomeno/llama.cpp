@@ -27,6 +27,27 @@ static __global__ void acc_f32(const float * x, const float * y, float * dst, co
     dst[i] = val;
 }
 
+// in place: only the elements of the view, dst += y
+static __global__ void acc_f32_inplace(const float * y, float * dst, const int64_t ne,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const int64_t s11, const int64_t s12, const int64_t s13, const int64_t offset) {
+    const int64_t i = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    int64_t tmp = i;
+    const int64_t i10 = tmp % ne10;
+    tmp /= ne10;
+    const int64_t i11 = tmp % ne11;
+    tmp /= ne11;
+    const int64_t i12 = tmp % ne12;
+    const int64_t i13 = tmp / ne12;
+
+    dst[offset + i13*s13 + i12*s12 + i11*s11 + i10] += y[i];
+}
+
 static void acc_f32_cuda(const float * x, const float * y, float * dst, const int64_t n_elements,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s1, const int64_t s2, const int64_t s3, const int64_t offset, cudaStream_t stream) {
@@ -56,6 +77,14 @@ void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s2     = dst->op_params[1] / sizeof(float);
     const int64_t s3     = dst->op_params[2] / sizeof(float);
     const int64_t offset = dst->op_params[3] / sizeof(float);
+
+    if (dst_d == src0_d) {
+        const int64_t n = ggml_nelements(src1);
+        const int num_blocks = (n + CUDA_ACC_BLOCK_SIZE - 1) / CUDA_ACC_BLOCK_SIZE;
+        acc_f32_inplace<<<num_blocks, CUDA_ACC_BLOCK_SIZE, 0, stream>>>(src1_d, dst_d, n, src1->ne[0], src1->ne[1], src1->ne[2],
+            s1, s2, s3, offset);
+        return;
+    }
 
     acc_f32_cuda(src0_d, src1_d, dst_d, ggml_nelements(dst), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], s1, s2, s3, offset, stream);
 }

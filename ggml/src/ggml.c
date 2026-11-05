@@ -6962,11 +6962,13 @@ static void ggml_acc_or_set(
     if (!ggml_is_contiguous(tensor)) {
         tensor = ggml_cont(ctx, tensor); // the backends take a contiguous src1 for acc
     }
+    // the partial sums of a chain of accs are read by the next acc only, so the chain works in place
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
+        const bool inplace = cgraph->grad_accs[isrc] || cgraph->grads[isrc]->op == GGML_OP_ACC;
+        cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, inplace);
     } else {
         struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
-        cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
+        cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, true);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
