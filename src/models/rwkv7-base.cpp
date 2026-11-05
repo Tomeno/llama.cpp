@@ -80,14 +80,17 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_channel_mix(const llama_layer * 
     return cur;
 }
 
+bool llm_build_rwkv7_base::rwkv7_fused(const llama_layer & layer) const {
+    return layer.time_mix_g1 && layer.time_mix_g2 && layer.time_mix_ln && layer.time_mix_ln_b;
+}
+
 ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * inp,
                                                          ggml_tensor *        cur,
                                                          ggml_tensor *        x_prev,
                                                          ggml_tensor *&       first_layer_value,
                                                          const llama_ubatch & ubatch,
-                                                         int                  il) const {
-    const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
-
+                                                         int                  il,
+                                                         ggml_tensor *        shift) const {
     const auto n_tokens     = ubatch.n_tokens;
     const auto n_seqs       = ubatch.n_seqs;
     const auto n_embd       = hparams.n_embd;
@@ -95,11 +98,13 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     const auto head_count   = n_embd / head_size;
     const auto n_seq_tokens = ubatch.n_seq_tokens;
 
-    const auto kv_head = mctx_cur->get_head();
-
     const auto & layer = model.layers[il];
 
     bool has_gating = layer.time_mix_g1 && layer.time_mix_g2;
+
+    if (shift && rwkv7_fused(layer)) {
+        return build_rwkv7_time_mix_fused(inp, cur, shift, first_layer_value, ubatch, il);
+    }
 
     ggml_tensor * sx    = ggml_sub(ctx0, x_prev, cur);
     ggml_tensor * dummy = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_embd, n_seq_tokens, n_seqs, has_gating ? 6 : 5);
@@ -155,31 +160,7 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     v = ggml_reshape_3d(ctx0, v, head_size, head_count, n_tokens);
     a = ggml_reshape_3d(ctx0, a, head_size, head_count, n_tokens);
 
-    ggml_tensor * wkv_state;
-    if (cparams.state_grad) {
-        auto inp_param = std::make_unique<llm_graph_input_rwkv_state_param>(mctx_cur, mctx_cur->get_s_l(il));
-        inp_param->param = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_s(), n_seqs);
-        ggml_set_input(inp_param->param);
-        ggml_set_param(inp_param->param);
-        ggml_format_name(inp_param->param, "state_param-%d", il);
-        res->t_state_param[il] = inp_param->param;
-        wkv_state = inp_param->param;
-        res->add_input(std::move(inp_param));
-    } else {
-        wkv_state = build_rs(inp, mctx_cur->get_s_l(il), hparams.n_embd_s(), n_seqs);
-    }
-
-    ggml_tensor * wkv_output = ggml_rwkv_wkv7(ctx0, r, w, k, v, ggml_neg(ctx0, kk), ggml_mul(ctx0, kk, a), wkv_state);
-    cur                      = ggml_view_1d(ctx0, wkv_output, n_embd * n_tokens, 0);
-    wkv_state = ggml_view_1d(ctx0, wkv_output, n_embd * head_size * n_seqs, n_embd * n_tokens * sizeof(float));
-
-    // state_grad: the cache is not written (a later pass of gradient checkpointing reads the same states)
-    if (!cparams.state_grad) {
-        ggml_build_forward_expand(
-            gf, ggml_cpy(ctx0, wkv_state,
-                         ggml_view_1d(ctx0, mctx_cur->get_s_l(il), hparams.n_embd_s() * n_seqs,
-                                      hparams.n_embd_s() * kv_head * ggml_element_size(mctx_cur->get_s_l(il)))));
-    }
+    cur = build_rwkv7_wkv(inp, r, w, k, v, ggml_neg(ctx0, kk), ggml_mul(ctx0, kk, a), n_seqs, il);
 
     if (layer.time_mix_ln && layer.time_mix_ln_b) {
         // group norm with head_count groups
@@ -199,6 +180,100 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     if (has_gating) {
         cur = ggml_mul(ctx0, cur, g);
     }
+    cur = build_lora_mm(layer.time_mix_output, cur);
+
+    return ggml_reshape_3d(ctx0, cur, n_embd, n_seq_tokens, n_seqs);
+}
+
+ggml_tensor * llm_build_rwkv7_base::build_rwkv7_wkv(llm_graph_input_rs * inp,
+                                                   ggml_tensor *        r,
+                                                   ggml_tensor *        w,
+                                                   ggml_tensor *        k,
+                                                   ggml_tensor *        v,
+                                                   ggml_tensor *        a,
+                                                   ggml_tensor *        b,
+                                                   int64_t              n_seqs,
+                                                   int                  il) const {
+    const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
+
+    const auto n_embd    = hparams.n_embd;
+    const auto head_size = hparams.wkv_head_size;
+    const auto kv_head   = mctx_cur->get_head();
+
+    ggml_tensor * wkv_state;
+    if (cparams.state_grad) {
+        auto inp_param = std::make_unique<llm_graph_input_rwkv_state_param>(mctx_cur, mctx_cur->get_s_l(il));
+        inp_param->param = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_s(), n_seqs);
+        ggml_set_input(inp_param->param);
+        ggml_set_param(inp_param->param);
+        ggml_format_name(inp_param->param, "state_param-%d", il);
+        res->t_state_param[il] = inp_param->param;
+        wkv_state = inp_param->param;
+        res->add_input(std::move(inp_param));
+    } else {
+        wkv_state = build_rs(inp, mctx_cur->get_s_l(il), hparams.n_embd_s(), n_seqs);
+    }
+
+    ggml_tensor * wkv_output = ggml_rwkv_wkv7(ctx0, r, w, k, v, a, b, wkv_state);
+    ggml_tensor * out = ggml_view_1d(ctx0, wkv_output, n_embd * n_tokens, 0);
+    wkv_state = ggml_view_1d(ctx0, wkv_output, n_embd * head_size * n_seqs, n_embd * n_tokens * sizeof(float));
+
+    // state_grad: the cache is not written (a later pass of gradient checkpointing reads the same states)
+    if (!cparams.state_grad) {
+        ggml_build_forward_expand(
+            gf, ggml_cpy(ctx0, wkv_state,
+                         ggml_view_1d(ctx0, mctx_cur->get_s_l(il), hparams.n_embd_s() * n_seqs,
+                                      hparams.n_embd_s() * kv_head * ggml_element_size(mctx_cur->get_s_l(il)))));
+    }
+
+    return out;
+}
+
+ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix_fused(llm_graph_input_rs * inp,
+                                                               ggml_tensor *        cur,
+                                                               ggml_tensor *        shift,
+                                                               ggml_tensor *&       first_layer_value,
+                                                               const llama_ubatch & ubatch,
+                                                               int                  il) const {
+    const auto n_seqs       = ubatch.n_seqs;
+    const auto n_seq_tokens = ubatch.n_seq_tokens;
+    const auto n_embd       = hparams.n_embd;
+    const auto head_size    = hparams.wkv_head_size;
+    const auto head_count   = n_embd / head_size;
+
+    const auto & layer = model.layers[il];
+
+    // the 6 lerps of the token shift, [n_embd, n_tokens] each
+    ggml_tensor * xxx = ggml_rwkv7_lerp(ctx0, cur, shift, ggml_reshape_2d(ctx0, layer.time_mix_lerp_fused, n_embd, 6));
+    auto lerp = [&](int i) { return ggml_view_2d(ctx0, xxx, n_embd, n_tokens, xxx->nb[1], i * n_embd * n_tokens * sizeof(float)); };
+
+    ggml_tensor * r = build_lora_mm(layer.time_mix_receptance, lerp(0));
+    ggml_tensor * w = ggml_rwkv7_decay(ctx0,
+        ggml_mul_mat(ctx0, layer.time_mix_w2, ggml_tanh(ctx0, ggml_mul_mat(ctx0, layer.time_mix_w1, lerp(1)))), layer.time_mix_w0);
+    ggml_tensor * k = build_lora_mm(layer.time_mix_key, lerp(2));
+    ggml_tensor * v = build_lora_mm(layer.time_mix_value, lerp(3));
+    if (first_layer_value == nullptr) {
+        first_layer_value = v;
+    } else {
+        v = ggml_rwkv7_vres(ctx0, v, first_layer_value,
+            ggml_mul_mat(ctx0, layer.time_mix_v2, ggml_mul_mat(ctx0, layer.time_mix_v1, lerp(3))), layer.time_mix_v0);
+    }
+    ggml_tensor * a12 = ggml_mul_mat(ctx0, layer.time_mix_a2, ggml_mul_mat(ctx0, layer.time_mix_a1, lerp(4)));
+    ggml_tensor * g   = ggml_mul_mat(ctx0, layer.time_mix_g2, ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, layer.time_mix_g1, lerp(5))));
+
+    // [n_embd, n_tokens, 3]: the new k, the wkv7 a (-kk) and b (kk * a)
+    ggml_tensor * kka = ggml_rwkv7_kka(ctx0, k, a12, layer.time_mix_a0, layer.time_mix_k_k, layer.time_mix_k_a, head_size);
+    auto part = [&](int i) {
+        return ggml_reshape_3d(ctx0, ggml_view_2d(ctx0, kka, n_embd, n_tokens, kka->nb[1], i * kka->nb[2]), head_size, head_count, n_tokens);
+    };
+    k = part(0);
+
+    ggml_tensor * y = build_rwkv7_wkv(inp,
+        ggml_reshape_3d(ctx0, r, head_size, head_count, n_tokens),
+        ggml_reshape_3d(ctx0, w, head_size, head_count, n_tokens), k,
+        ggml_reshape_3d(ctx0, v, head_size, head_count, n_tokens), part(1), part(2), n_seqs, il);
+
+    cur = ggml_rwkv7_out(ctx0, ggml_reshape_2d(ctx0, y, n_embd, n_tokens), r, k, v, g, layer.time_mix_ln, layer.time_mix_ln_b, layer.time_mix_r_k, head_size, 64e-5f);
     cur = build_lora_mm(layer.time_mix_output, cur);
 
     return ggml_reshape_3d(ctx0, cur, n_embd, n_seq_tokens, n_seqs);

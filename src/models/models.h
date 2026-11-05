@@ -152,12 +152,37 @@ struct llm_build_rwkv7_base : public llm_graph_context {
                                           ggml_tensor *       cur,
                                           ggml_tensor *       x_prev,
                                           llm_arch            arch) const;
+    // shift (the token shift [n_embd, 1, n_seqs], may be nullptr): the fused ops (ggml_rwkv7_*) replace x_prev and most
+    // of the element-wise ops
     ggml_tensor * build_rwkv7_time_mix(llm_graph_input_rs * inp,
                                        ggml_tensor *        cur,
                                        ggml_tensor *        x_prev,
                                        ggml_tensor *&       first_layer_value,
                                        const llama_ubatch & ubatch,
-                                       int                  il) const;
+                                       int                  il,
+                                       ggml_tensor *        shift = nullptr) const;
+
+    // the fused ops can be used for this layer
+    bool rwkv7_fused(const llama_layer & layer) const;
+
+    ggml_tensor * build_rwkv7_time_mix_fused(llm_graph_input_rs * inp,
+                                             ggml_tensor *        cur,
+                                             ggml_tensor *        shift,
+                                             ggml_tensor *&       first_layer_value,
+                                             const llama_ubatch & ubatch,
+                                             int                  il) const;
+
+    // wkv7 from the state of layer il (a parameter in the state-gradient mode), the new state is stored; the output
+    // [n_embd * n_tokens]
+    ggml_tensor * build_rwkv7_wkv(llm_graph_input_rs * inp,
+                                  ggml_tensor *        r,
+                                  ggml_tensor *        w,
+                                  ggml_tensor *        k,
+                                  ggml_tensor *        v,
+                                  ggml_tensor *        a,
+                                  ggml_tensor *        b,
+                                  int64_t              n_seqs,
+                                  int                  il) const;
 
     // state_grad with gradient checkpointing: a [n_embd, n_tokens, ne2] input tensor from host data
     ggml_tensor * build_seg_host(const std::vector<float> * data, int64_t ne2) const;

@@ -169,11 +169,14 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         ggml_tensor * att_norm = build_norm(inpL, layer->attn_norm, layer->attn_norm_b, LLM_NORM, il);
         cb(att_norm, "attn_norm", il);
 
-        ggml_tensor * x_prev = ggml_concat(
+        // the fused ops take the token shift itself
+        const bool fused = rwkv7_fused(*layer);
+
+        ggml_tensor * x_prev = fused ? nullptr : ggml_concat(
             ctx0, att_shift,
             ggml_view_3d(ctx0, att_norm, n_embd, n_seq_tokens - 1, n_seqs, att_norm->nb[1], att_norm->nb[2], 0), 1);
 
-        cur = build_rwkv7_time_mix(rs_inp, att_norm, x_prev, v_first, ubatch, il);
+        cur = build_rwkv7_time_mix(rs_inp, att_norm, x_prev, v_first, ubatch, il, att_shift);
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
@@ -181,9 +184,15 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         ggml_tensor * ffn_norm = build_norm(ffn_inp, layer->attn_norm_2, layer->attn_norm_2_b, LLM_NORM, il);
         cb(ffn_norm, "ffn_norm", il);
 
-        x_prev = ggml_concat(
-            ctx0, ffn_shift,
-            ggml_view_3d(ctx0, ffn_norm, n_embd, n_seq_tokens - 1, n_seqs, ffn_norm->nb[1], ffn_norm->nb[2], 0), 1);
+        // fused: the lerp of the channel mix instead of x_prev
+        ggml_tensor * xk = nullptr;
+        if (fused) {
+            xk = ggml_rwkv7_lerp(ctx0, ffn_norm, ffn_shift, layer->channel_mix_lerp_k);
+        } else {
+            x_prev = ggml_concat(
+                ctx0, ffn_shift,
+                ggml_view_3d(ctx0, ffn_norm, n_embd, n_seq_tokens - 1, n_seqs, ffn_norm->nb[1], ffn_norm->nb[2], 0), 1);
+        }
 
         token_shift = ggml_concat(ctx0,
                                   ggml_view_3d(ctx0, att_norm, n_embd, 1, n_seqs, att_norm->nb[1], att_norm->nb[2],
@@ -197,14 +206,23 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
 
         ffn_inp  = ggml_reshape_2d(ctx0, ffn_inp, n_embd, n_tokens);
         ffn_norm = ggml_reshape_2d(ctx0, ffn_norm, n_embd, n_tokens);
-        x_prev   = ggml_reshape_2d(ctx0, x_prev, n_embd, n_tokens);
 
-        if (il == n_layer - 1 && inp_out_ids) {
-            ffn_inp  = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
-            ffn_norm = ggml_get_rows(ctx0, ffn_norm, inp_out_ids);
-            x_prev   = ggml_get_rows(ctx0, x_prev, inp_out_ids);
+        if (fused) {
+            xk = ggml_reshape_2d(ctx0, xk, n_embd, n_tokens);
+            if (il == n_layer - 1 && inp_out_ids) {
+                ffn_inp = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
+                xk      = ggml_get_rows(ctx0, xk, inp_out_ids);
+            }
+            cur = build_lora_mm(layer->channel_mix_value, ggml_sqr(ctx0, ggml_relu(ctx0, build_lora_mm(layer->channel_mix_key, xk))));
+        } else {
+            x_prev = ggml_reshape_2d(ctx0, x_prev, n_embd, n_tokens);
+            if (il == n_layer - 1 && inp_out_ids) {
+                ffn_inp  = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
+                ffn_norm = ggml_get_rows(ctx0, ffn_norm, inp_out_ids);
+                x_prev   = ggml_get_rows(ctx0, x_prev, inp_out_ids);
+            }
+            cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7);
         }
-        cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7);
         cur = ggml_add(ctx0, cur, ffn_inp);
 
         cur = build_cvec(cur, il);
