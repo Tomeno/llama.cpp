@@ -7015,7 +7015,10 @@ static void ggml_acc_or_set(
         const bool inplace = cgraph->grad_accs[isrc] || cgraph->grads[isrc]->op == GGML_OP_ACC;
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, inplace);
     } else {
-        struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+        // fill writes the zeros without reading src
+        struct ggml_tensor * a_zero = (src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) && ggml_is_contiguous(src) ?
+            ggml_fill(ctx, src, 0.0f) :
+            ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, true);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
