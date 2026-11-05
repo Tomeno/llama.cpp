@@ -214,6 +214,11 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_wkv(llm_graph_input_rs * inp,
         wkv_state = build_rs(inp, mctx_cur->get_s_l(il), hparams.n_embd_s(), n_seqs);
     }
 
+    // states read in place (the cache rows themselves): the new state is written over them
+    if (!cparams.state_grad && inp->in_place) {
+        return ggml_rwkv_wkv7_inplace(ctx0, r, w, k, v, a, b, wkv_state);
+    }
+
     ggml_tensor * wkv_output = ggml_rwkv_wkv7(ctx0, r, w, k, v, a, b, wkv_state);
     ggml_tensor * out = ggml_view_1d(ctx0, wkv_output, n_embd * n_tokens, 0);
     wkv_state = ggml_view_1d(ctx0, wkv_output, n_embd * head_size * n_seqs, n_embd * n_tokens * sizeof(float));
