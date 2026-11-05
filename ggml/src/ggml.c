@@ -1089,6 +1089,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV6",
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
+    "RWKV_WKV7_BACK",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
@@ -1113,7 +1114,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,6 +1206,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv6(k, v, r, tf, td, s)",
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
+    "rwkv_wkv7_back(r, w, k, v, a, b, s, grad)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
@@ -1229,7 +1231,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6028,6 +6030,47 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     return result;
 }
 
+// ggml_rwkv_wkv7_back
+
+struct ggml_tensor * ggml_rwkv_wkv7_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * grad) {
+    GGML_ASSERT(ggml_is_contiguous(grad));
+
+    const int64_t S = k->ne[0];
+    const int64_t H = k->ne[1];
+    const int64_t n_tokens = k->ne[2];
+    const int64_t n_seqs = state->ne[1];
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ggml_nelements(grad) == S*H*(n_tokens + S*n_seqs));
+    GGML_ASSERT(ggml_is_contiguous(state) && ggml_nelements(state) == S*S*H*n_seqs);
+    struct ggml_tensor * srcs[6] = { r, w, k, v, a, b };
+    for (int i = 0; i < 6; ++i) {
+        GGML_ASSERT(ggml_is_contiguous(srcs[i]) && ggml_are_same_shape(srcs[i], k));
+    }
+
+    const int64_t ne[4] = { S * H, 6 * n_tokens + S * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_RWKV_WKV7_BACK;
+    result->src[0] = r;
+    result->src[1] = w;
+    result->src[2] = k;
+    result->src[3] = v;
+    result->src[4] = a;
+    result->src[5] = b;
+    result->src[6] = state;
+    result->src[7] = grad;
+
+    return result;
+}
+
 // ggml_unary
 
 static struct ggml_tensor * ggml_unary_impl(
@@ -7403,6 +7446,42 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, ggml_transpose(ctx, ggml_ssm_conv(ctx, g, c_flip))));
             }
             GGML_ASSERT(!src1_needs_grads && "backward pass for the ssm_conv kernel not implemented");
+        } break;
+        case GGML_OP_NORM: {
+            // y = (x - mean(x))/sigma: dx = (dy - mean(dy) - y*mean(dy*y))/sigma, sigma = sqrt(var(x) + eps)
+            if (src0_needs_grads) {
+                float eps;
+                memcpy(&eps, tensor->op_params, sizeof(float));
+                const float n = (float) src0->ne[0];
+                struct ggml_tensor * xc  = ggml_sub(ctx, src0, ggml_scale(ctx, ggml_sum_rows(ctx, src0), 1.0f/n));
+                struct ggml_tensor * sig = ggml_sqrt(ctx, ggml_scale_bias(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, xc)), 1.0f/n, eps));
+                struct ggml_tensor * g   = ggml_sub(ctx, grad, ggml_scale(ctx, ggml_sum_rows(ctx, grad), 1.0f/n));
+                g = ggml_sub(ctx, g, ggml_mul(ctx, tensor, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, grad, tensor)), 1.0f/n)));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, g, sig));
+            }
+        } break;
+        case GGML_OP_L2_NORM: {
+            // y = x/max(|x|, eps): dx = (dy - y*(dy.y))/max(|x|, eps)
+            if (src0_needs_grads) {
+                const float eps = ggml_get_op_params_f32(tensor, 0);
+                struct ggml_tensor * nrm = ggml_clamp(ctx, ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, src0))), eps, INFINITY);
+                struct ggml_tensor * g   = ggml_sub(ctx, grad, ggml_mul(ctx, tensor, ggml_sum_rows(ctx, ggml_mul(ctx, grad, tensor))));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, g, nrm));
+            }
+        } break;
+        case GGML_OP_RWKV_WKV7: {
+            struct ggml_tensor * back = ggml_rwkv_wkv7_back(ctx, src0, src1, src2, tensor->src[3], tensor->src[4],
+                tensor->src[5], tensor->src[6], ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad));
+            const int64_t n_tok = ggml_nelements(src0);
+            for (int j = 0; j < 7; ++j) {
+                struct ggml_tensor * src = tensor->src[j];
+                const size_t isrc = ggml_hash_find(hash_set, src);
+                if (isrc == GGML_HASHSET_FULL || !ggml_bitset_get(hash_set->used, isrc) || !grads_needed[isrc]) {
+                    continue;
+                }
+                struct ggml_tensor * g = ggml_view_1d(ctx, back, ggml_nelements(src), j*n_tok*sizeof(float));
+                ggml_add_or_set(ctx, cgraph, isrc, ggml_reshape(ctx, g, src));
+            }
         } break;
         case GGML_OP_NONE: {
             // noop

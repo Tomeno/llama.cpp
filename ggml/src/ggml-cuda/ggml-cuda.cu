@@ -2553,6 +2553,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
+        case GGML_OP_RWKV_WKV7_BACK:
+            ggml_cuda_op_rwkv_wkv7_back(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
             break;
@@ -5982,6 +5985,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
             return true;
+        case GGML_OP_RWKV_WKV7_BACK:
+            return op->src[0]->ne[0] == CUDA_WKV_BLOCK_SIZE;
         case GGML_OP_GATED_DELTA_NET:
             return true;
         case GGML_OP_DSV4_HC_COMB:

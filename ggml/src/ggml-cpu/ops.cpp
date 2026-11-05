@@ -11933,6 +11933,127 @@ void ggml_compute_forward_rwkv_wkv7(
     }
 }
 
+// ggml_compute_forward_rwkv_wkv7_back
+
+// per (sequence, head): a forward pass keeps the state every CH tokens, then every chunk is recomputed from its
+// checkpoint (all states of the chunk) and backpropagated, the last one first
+static void ggml_compute_forward_rwkv_wkv7_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    constexpr int64_t CH = 16;
+
+    const int64_t T      = dst->src[1]->ne[2];
+    const int64_t N      = dst->src[1]->ne[0];
+    const int64_t H      = dst->src[1]->ne[1];
+    const int64_t C      = N * H;
+    const int64_t n_seqs = dst->src[6]->ne[1];
+    const int64_t Ts     = T / n_seqs;
+    const int64_t n_ch   = (Ts + CH - 1) / CH;
+
+    const float * r  = (const float *) dst->src[0]->data;
+    const float * w  = (const float *) dst->src[1]->data;
+    const float * k  = (const float *) dst->src[2]->data;
+    const float * v  = (const float *) dst->src[3]->data;
+    const float * a  = (const float *) dst->src[4]->data;
+    const float * b  = (const float *) dst->src[5]->data;
+    const float * s0 = (const float *) dst->src[6]->data;
+    const float * gy = (const float *) dst->src[7]->data;
+    const float * gs = gy + C * T;
+
+    float * d  = (float *) dst->data;
+    float * dr = d;
+    float * dw = d + 1 * C * T;
+    float * dk = d + 2 * C * T;
+    float * dv = d + 3 * C * T;
+    float * da = d + 4 * C * T;
+    float * db = d + 5 * C * T;
+    float * ds = d + 6 * C * T;
+
+    std::vector<float> ck(n_ch * N * N);      // the state at the start of every chunk
+    std::vector<float> sb((CH + 1) * N * N);  // the states of the current chunk
+    std::vector<float> sa(CH * N), dS(N * N), dsa(N);
+
+    for (int64_t u = params->ith; u < n_seqs * H; u += params->nth) {
+        const int64_t bi = u / H;
+        const int64_t h  = u % H;
+        const int64_t so = bi * C * N + h * N * N;
+
+        // one step from S (state before token t) to S1; sav: S a
+        auto step = [&](const float * S, float * S1, float * sav, int64_t t) {
+            const int64_t o = t * C + h * N;
+            for (int64_t i = 0; i < N; ++i) {
+                float x = 0.0f;
+                for (int64_t j = 0; j < N; ++j) {
+                    x += S[i * N + j] * a[o + j];
+                }
+                sav[i] = x;
+                for (int64_t j = 0; j < N; ++j) {
+                    S1[i * N + j] = S[i * N + j] * w[o + j] + v[o + i] * k[o + j] + x * b[o + j];
+                }
+            }
+        };
+
+        // checkpoints
+        std::copy(s0 + so, s0 + so + N * N, sb.data());
+        for (int64_t t = 0; t < Ts; ++t) {
+            if (t % CH == 0) {
+                std::copy(sb.begin(), sb.begin() + N * N, ck.begin() + (t / CH) * N * N);
+            }
+            step(sb.data(), sb.data() + N * N, sa.data(), bi * Ts + t);
+            std::copy(sb.begin() + N * N, sb.begin() + 2 * N * N, sb.begin());
+        }
+
+        std::copy(gs + so, gs + so + N * N, dS.data());
+        for (int64_t c = n_ch - 1; c >= 0; --c) {
+            const int64_t tb = c * CH;
+            const int64_t te = std::min(Ts, tb + CH);
+            std::copy(ck.begin() + c * N * N, ck.begin() + (c + 1) * N * N, sb.begin());
+            for (int64_t t = tb; t < te; ++t) {
+                step(sb.data() + (t - tb) * N * N, sb.data() + (t - tb + 1) * N * N, sa.data() + (t - tb) * N, bi * Ts + t);
+            }
+            for (int64_t t = te - 1; t >= tb; --t) {
+                const int64_t o = (bi * Ts + t) * C + h * N;
+                const float * Sp = sb.data() + (t - tb) * N * N;
+                const float * Sc = Sp + N * N;
+                const float * sat = sa.data() + (t - tb) * N;
+                for (int64_t j = 0; j < N; ++j) {
+                    dr[o + j] = dw[o + j] = dk[o + j] = da[o + j] = db[o + j] = 0.0f;
+                }
+                for (int64_t i = 0; i < N; ++i) {
+                    const float dy = gy[o + i];
+                    float dvi = 0.0f, dsai = 0.0f;
+                    for (int64_t j = 0; j < N; ++j) {
+                        dr[o + j] += Sc[i * N + j] * dy;
+                        float & g = dS[i * N + j];
+                        g += dy * r[o + j];
+                        dvi  += g * k[o + j];
+                        dsai += g * b[o + j];
+                        dk[o + j] += g * v[o + i];
+                        db[o + j] += g * sat[i];
+                        dw[o + j] += g * Sp[i * N + j];
+                    }
+                    dv[o + i] = dvi;
+                    dsa[i] = dsai;
+                }
+                for (int64_t i = 0; i < N; ++i) {
+                    for (int64_t j = 0; j < N; ++j) {
+                        da[o + j] += dsa[i] * Sp[i * N + j];
+                        dS[i * N + j] = dS[i * N + j] * w[o + j] + dsa[i] * a[o + j];
+                    }
+                }
+            }
+        }
+        std::copy(dS.begin(), dS.end(), ds + so);
+    }
+}
+
+void ggml_compute_forward_rwkv_wkv7_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32 && dst->src[6]->type == GGML_TYPE_F32);
+    ggml_compute_forward_rwkv_wkv7_back_f32(params, dst);
+}
+
 // ggml_compute_forward_map_custom1
 
 void ggml_compute_forward_map_custom1(

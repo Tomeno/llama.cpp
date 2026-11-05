@@ -579,6 +579,7 @@ extern "C" {
         GGML_OP_RWKV_WKV6,
         GGML_OP_GATED_LINEAR_ATTN,
         GGML_OP_RWKV_WKV7,
+        GGML_OP_RWKV_WKV7_BACK,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
@@ -2620,6 +2621,19 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * state);
+
+    // gradient of ggml_rwkv_wkv7: grad has the shape of its result (output gradient, then the final state gradient);
+    // the result is [S*H, 6*n_tokens + S*n_seqs]: the gradients of r, w, k, v, a, b and the initial state, in this order
+    GGML_API struct ggml_tensor * ggml_rwkv_wkv7_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * grad);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix
     *  without zeroes on the diagonal (i.e. invertible).

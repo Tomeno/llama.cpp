@@ -5305,6 +5305,71 @@ struct test_rwkv_wkv7 : public test_case {
     }
 };
 
+// GGML_OP_RWKV_WKV7_BACK
+struct test_rwkv_wkv7_back : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_count, head_size, n_seq_tokens, n_seqs);
+    }
+
+    test_rwkv_wkv7_back(int64_t head_count = 4, int64_t head_size = 64, int64_t n_seq_tokens = 37, int64_t n_seqs = 2)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tokens = n_seq_tokens * n_seqs;
+        auto inp = [&]() { return ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens); };
+        ggml_tensor * r  = inp();
+        ggml_tensor * w  = ggml_exp(ctx, ggml_scale(ctx, ggml_sigmoid(ctx, inp()), -0.606531f));
+        ggml_tensor * k  = inp();
+        ggml_tensor * v  = inp();
+        ggml_tensor * kk = ggml_l2_norm(ctx, inp(), 1e-12f);
+        ggml_tensor * a  = ggml_neg(ctx, kk);
+        ggml_tensor * b  = ggml_mul(ctx, kk, ggml_sigmoid(ctx, inp()));
+        ggml_tensor * s  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_size * head_size * head_count, n_seqs);
+        ggml_tensor * g  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_size * head_count, n_tokens + head_size * n_seqs);
+        return ggml_rwkv_wkv7_back(ctx, r, w, k, v, a, b, s, g);
+    }
+};
+
+// GGML_OP_NORM / GGML_OP_L2_NORM gradients (weighted by a random tensor: the sum of a normalized row is constant)
+struct test_norm_grad : public test_case {
+    const bool l2;
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR2(l2, ne);
+    }
+
+    test_norm_grad(bool l2 = false, std::array<int64_t, 4> ne = {64, 5, 4, 3}) : l2(l2), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(x);
+        ggml_set_name(x, "x");
+        ggml_tensor * y = l2 ? ggml_l2_norm(ctx, x, 1e-12f) : ggml_norm(ctx, x, 1e-5f);
+        ggml_tensor * c = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(c, "c");
+        return ggml_mul(ctx, y, c);
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    // f32 finite differences of a sum over thousands of elements: relative errors of ~1e-3
+    double max_maa_err() override {
+        return 1e-2;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 static int32_t test_get_op_params_i32(const ggml_tensor * tensor, uint32_t i) {
     GGML_ASSERT(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     return tensor->op_params[i];
@@ -11048,6 +11113,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 128, 4));
+    test_cases.emplace_back(new test_rwkv_wkv7_back(4, 64, 37, 2));
+    test_cases.emplace_back(new test_rwkv_wkv7_back(32, 64, 128, 1));
+    test_cases.emplace_back(new test_norm_grad(false));
+    test_cases.emplace_back(new test_norm_grad(true));
 
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 1, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 1));
