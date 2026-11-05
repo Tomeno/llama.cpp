@@ -2,9 +2,62 @@
 
 #include "llama-memory-recurrent.h"
 
+// state_grad: the initial wkv states of the ubatch sequences on one layer, as a parameter: a copy of their cache rows
+class llm_graph_input_rwkv_state_param : public llm_graph_input_i {
+public:
+    llm_graph_input_rwkv_state_param(const llama_memory_recurrent_context * mctx, ggml_tensor * s_all) : mctx(mctx), s_all(s_all) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(s_all->type == GGML_TYPE_F32);
+
+        const size_t row = ggml_row_size(param->type, param->ne[0]);
+        std::vector<uint8_t> buf(row);
+        for (int64_t i = 0; i < param->ne[1]; ++i) {
+            const int32_t cell = mctx->s_copy(i);
+            if (cell == mctx->get_rs_z()) {
+                std::fill(buf.begin(), buf.end(), 0); // a new sequence: the zero state
+            } else {
+                ggml_backend_tensor_get(s_all, buf.data(), cell*s_all->nb[1], row);
+            }
+            ggml_backend_tensor_set(param, buf.data(), i*param->nb[1], row);
+        }
+    }
+
+    const llama_memory_recurrent_context * mctx;
+    ggml_tensor * s_all;
+
+    ggml_tensor * param = nullptr; // F32 [n_embd_s, n_seqs]
+};
+
+// state_grad segment: a tensor from host data (the input of the segment, or the gradient of its output)
+class llm_graph_input_rwkv_seg_host : public llm_graph_input_i {
+public:
+    llm_graph_input_rwkv_seg_host(const std::vector<float> * data) : data(data) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(data && data->size() == (size_t) ggml_nelements(t));
+        ggml_backend_tensor_set(t, data->data(), 0, ggml_nbytes(t));
+    }
+
+    const std::vector<float> * data;
+
+    ggml_tensor * t = nullptr;
+};
+
 llm_build_rwkv7_base::llm_build_rwkv7_base(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params),
     model(model) {}
+
+ggml_tensor * llm_build_rwkv7_base::build_seg_host(const std::vector<float> * data, int64_t ne2) const {
+    auto inp = std::make_unique<llm_graph_input_rwkv_seg_host>(data);
+    inp->t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens, ne2);
+    ggml_set_input(inp->t);
+    ggml_tensor * t = inp->t;
+    res->add_input(std::move(inp));
+    return t;
+}
 
 ggml_tensor * llm_build_rwkv7_base::build_rwkv7_channel_mix(const llama_layer * layer,
                                                             ggml_tensor *       cur,
@@ -102,16 +155,31 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
     v = ggml_reshape_3d(ctx0, v, head_size, head_count, n_tokens);
     a = ggml_reshape_3d(ctx0, a, head_size, head_count, n_tokens);
 
-    ggml_tensor * wkv_state = build_rs(inp, mctx_cur->get_s_l(il), hparams.n_embd_s(), n_seqs);
+    ggml_tensor * wkv_state;
+    if (cparams.state_grad) {
+        auto inp_param = std::make_unique<llm_graph_input_rwkv_state_param>(mctx_cur, mctx_cur->get_s_l(il));
+        inp_param->param = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_s(), n_seqs);
+        ggml_set_input(inp_param->param);
+        ggml_set_param(inp_param->param);
+        ggml_format_name(inp_param->param, "state_param-%d", il);
+        res->t_state_param[il] = inp_param->param;
+        wkv_state = inp_param->param;
+        res->add_input(std::move(inp_param));
+    } else {
+        wkv_state = build_rs(inp, mctx_cur->get_s_l(il), hparams.n_embd_s(), n_seqs);
+    }
 
     ggml_tensor * wkv_output = ggml_rwkv_wkv7(ctx0, r, w, k, v, ggml_neg(ctx0, kk), ggml_mul(ctx0, kk, a), wkv_state);
     cur                      = ggml_view_1d(ctx0, wkv_output, n_embd * n_tokens, 0);
     wkv_state = ggml_view_1d(ctx0, wkv_output, n_embd * head_size * n_seqs, n_embd * n_tokens * sizeof(float));
 
-    ggml_build_forward_expand(
-        gf, ggml_cpy(ctx0, wkv_state,
-                     ggml_view_1d(ctx0, mctx_cur->get_s_l(il), hparams.n_embd_s() * n_seqs,
-                                  hparams.n_embd_s() * kv_head * ggml_element_size(mctx_cur->get_s_l(il)))));
+    // state_grad: the cache is not written (a later pass of gradient checkpointing reads the same states)
+    if (!cparams.state_grad) {
+        ggml_build_forward_expand(
+            gf, ggml_cpy(ctx0, wkv_state,
+                         ggml_view_1d(ctx0, mctx_cur->get_s_l(il), hparams.n_embd_s() * n_seqs,
+                                      hparams.n_embd_s() * kv_head * ggml_element_size(mctx_cur->get_s_l(il)))));
+    }
 
     if (layer.time_mix_ln && layer.time_mix_ln_b) {
         // group norm with head_count groups

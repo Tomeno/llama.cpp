@@ -158,6 +158,9 @@ struct llm_build_rwkv7_base : public llm_graph_context {
                                        ggml_tensor *&       first_layer_value,
                                        const llama_ubatch & ubatch,
                                        int                  il) const;
+
+    // state_grad with gradient checkpointing: a [n_embd, n_tokens, ne2] input tensor from host data
+    ggml_tensor * build_seg_host(const std::vector<float> * data, int64_t ne2) const;
 };
 
 //

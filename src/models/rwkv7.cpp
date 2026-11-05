@@ -129,8 +129,23 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
     ggml_tensor * inpL;
     ggml_tensor * v_first = nullptr;
 
-    inpL = build_inp_embd(model.tok_embd);
-    inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, 0);
+    // state_grad with gradient checkpointing: only the layers of the segment, from a given hidden state and the value of
+    // the first layer (v_first), [n_embd, n_tokens, 2]
+    const int il0 = grad_seg ? grad_seg->il0 : 0;
+    const int il1 = grad_seg ? grad_seg->il1 : n_layer;
+
+    if (il0 > 0) {
+        ggml_tensor * seg_inp = build_seg_host(grad_seg->inp, 2);
+        if (!grad_seg->fwd_only) {
+            ggml_set_param(seg_inp);
+        }
+        res->t_seg_inp = seg_inp;
+        inpL    = ggml_view_2d(ctx0, seg_inp, hparams.n_embd, n_tokens, seg_inp->nb[1], 0);
+        v_first = ggml_view_2d(ctx0, seg_inp, hparams.n_embd, n_tokens, seg_inp->nb[1], seg_inp->nb[2]);
+    } else {
+        inpL = build_inp_embd(model.tok_embd);
+        inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, 0);
+    }
 
     auto * rs_inp = build_rs_inp();
 
@@ -140,7 +155,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il0; il < il1; ++il) {
         const llama_layer * layer = &model.layers[il];
         inpL                      = ggml_reshape_3d(ctx0, inpL, n_embd, n_seq_tokens, n_seqs);
 
@@ -176,7 +191,9 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
                                   ggml_view_3d(ctx0, ffn_norm, n_embd, 1, n_seqs, ffn_norm->nb[1], ffn_norm->nb[2],
                                                (n_seq_tokens - 1) * n_embd * ggml_element_size(ffn_norm)),
                                   1);
-        ggml_build_forward_expand(gf, build_rwkv_token_shift_store(token_shift, ubatch, il));
+        if (!cparams.state_grad) {
+            ggml_build_forward_expand(gf, build_rwkv_token_shift_store(token_shift, ubatch, il));
+        }
 
         ffn_inp  = ggml_reshape_2d(ctx0, ffn_inp, n_embd, n_tokens);
         ffn_norm = ggml_reshape_2d(ctx0, ffn_norm, n_embd, n_tokens);
@@ -197,6 +214,23 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         inpL = cur;
     }
     cur = inpL;
+
+    if (il1 < n_layer) {
+        // not the last segment: the output hidden state and v_first, and as the loss their dot product with the given
+        // gradient
+        cur = ggml_concat(ctx0, ggml_reshape_3d(ctx0, cur, hparams.n_embd, n_tokens, 1),
+                                ggml_reshape_3d(ctx0, ggml_cont(ctx0, v_first), hparams.n_embd, n_tokens, 1), 2);
+        res->t_seg_out = cur;
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+        if (!grad_seg->fwd_only) {
+            res->t_loss = ggml_sum(ctx0, ggml_mul(ctx0, cur, build_seg_host(grad_seg->grad, 2)));
+            ggml_set_loss(res->t_loss);
+            ggml_build_forward_expand(gf, res->t_loss);
+        }
+        return;
+    }
+
     cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
 
     cb(cur, "result_norm", -1);

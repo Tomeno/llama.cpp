@@ -154,7 +154,7 @@ LLAMA_API void  llama_set_logprobs       (struct llama_context * ctx, float temp
 LLAMA_API void  llama_set_logprob_targets(struct llama_context * ctx, const llama_token * targets, int32_t n_tokens);
 LLAMA_API float llama_get_logprob_ith    (struct llama_context * ctx, int32_t i);
 
-// state-gradient mode (needs the log-prob mode; models with support: EdgeRock): a decode also computes the gradient of
+// state-gradient mode (needs the log-prob mode; models with support: EdgeRock, RWKV7): a decode also computes the gradient of
 // sum_i w[i] * logp[i] over the log-prob outputs (w[i]: the weight of batch token i, set before every decode) with respect
 // to the initial recurrent state of every sequence of the batch (the rows of llama_memory_seq_state_get). Every sequence
 // must start at position 0 and the batch must fit in one ubatch. The memory of the sequences is not written: remove
