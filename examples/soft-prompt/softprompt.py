@@ -65,10 +65,11 @@ def _load_lib(path: str) -> ctypes.CDLL:
     lib.sp_set_grad_ckpt.argtypes = [ctypes.c_void_p, ctypes.c_int32]
     lib.sp_state_grad.argtypes = [ctypes.c_void_p, _f32p, _i32p, ctypes.c_int32, _i32p, _i64p, _i32p, _i32p, _i64p, _i32p,
                                   _f32p, ctypes.c_float, _f32p, _f32p]
+    lib.sp_capture.argtypes = [ctypes.c_void_p, ctypes.c_int32, _f32p]
     lib.sp_generate.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, ctypes.c_int32,
                                 _i32p, _i64p, _i32p, ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
                                 ctypes.c_uint64, _i32p, _i32p, _i32p]
-    for f in ("sp_score", "sp_generate", "sp_token_embeddings", "sp_get_state", "sp_state_grad"):
+    for f in ("sp_score", "sp_generate", "sp_token_embeddings", "sp_get_state", "sp_state_grad", "sp_capture"):
         getattr(lib, f).restype = ctypes.c_int32
     return lib
 
@@ -201,6 +202,12 @@ class Engine:
                                       _ptr(pf, _i32p), _ptr(po, _i64p), _ptr(pl, _i32p),
                                       _ptr(rf, _i32p), _ptr(ro, _i64p), _ptr(rl, _i32p), float(temp), _ptr(out, _f32p)))
         return [out[o:o + n] for o, n in zip(ro, rl)]
+
+    def capture(self, n_layer: int, n_last: int) -> np.ndarray:
+        """With SP_CAPTURE=1: layer outputs of the last decode (one job), [n_layer - 1, n_last, n_embd]."""
+        out = np.zeros((n_layer - 1, n_last, self.n_embd), np.float32)
+        self._check(self.lib.sp_capture(self.ctx, n_last, _ptr(out, _f32p)))
+        return out
 
     def set_grad_ckpt(self, n_layers: int):
         """state_grad with gradient checkpointing in segments of n_layers layers (0: off): less GPU memory"""

@@ -15,6 +15,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -290,6 +291,25 @@ static llama_pos prefix(sp_ctx * c, const std::vector<const float *> & embd, con
     return pos;
 }
 
+// SP_CAPTURE=1: keeps the layer outputs (l_out-N) of the last ubatch, for sp_capture; one sequence per decode
+static std::vector<std::vector<float>> g_capture;
+
+static bool capture_cb(ggml_tensor * t, bool ask, void *) {
+    if (strncmp(t->name, "l_out-", 6) != 0) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+    const size_t il = atoi(t->name + 6);
+    if (g_capture.size() <= il) {
+        g_capture.resize(il + 1);
+    }
+    g_capture[il].resize(ggml_nelements(t));
+    ggml_backend_tensor_get(t, g_capture[il].data(), 0, ggml_nbytes(t));
+    return true;
+}
+
 struct sp_seq_job {
     const float       * theta;
     const float       * state; // nullptr: the state the prefix leaves
@@ -400,6 +420,9 @@ SP_API sp_ctx * sp_init(const char * model_path, int32_t n_gpu_layers, int32_t n
         cparams.n_threads_batch = c->n_threads;
         if (const char * e = getenv("SP_PROFILE"); e && atoi(e) >= 2) {
             cparams.cb_eval = op_prof_cb;
+        }
+        if (const char * e = getenv("SP_CAPTURE"); e && atoi(e) >= 1) {
+            cparams.cb_eval = capture_cb;
         }
         c->ctx = llama_init_from_model(c->model, cparams);
         if (!c->ctx) {
@@ -572,6 +595,24 @@ SP_API int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, 
         g_error = e.what();
         return -1;
     }
+}
+
+SP_API int32_t sp_capture(const sp_ctx * c, int32_t n_last, float * out) {
+    // the last layer keeps only the output rows
+    const int32_t n_layer = llama_model_n_layer(c->model) - 1;
+    if ((int32_t) g_capture.size() < n_layer) {
+        g_error = "nothing captured, SP_CAPTURE=1 has to be set before sp_init";
+        return -1;
+    }
+    const size_t n = (size_t) n_last * c->n_embd;
+    for (int32_t il = 0; il < n_layer; ++il) {
+        if (g_capture[il].size() < n) {
+            g_error = "fewer captured tokens than n_last";
+            return -1;
+        }
+        memcpy(out + il*n, g_capture[il].data() + g_capture[il].size() - n, n*sizeof(float));
+    }
+    return 0;
 }
 
 SP_API void sp_set_grad_ckpt(sp_ctx * c, int32_t n_layers) {

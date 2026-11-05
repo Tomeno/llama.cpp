@@ -45,6 +45,10 @@ int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_id
                       const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
                       const float * w, float temp, float * logp, float * grad);
 
+// with SP_CAPTURE=1 in the environment: the outputs of all layers but the last for the last n_last tokens of the last
+// decode, [n_layer - 1, n_last, n_embd]; the decode must hold one sequence
+int32_t sp_capture(const sp_ctx * c, int32_t n_last, float * out);
+
 int32_t sp_generate(sp_ctx * c, const float * theta, const float * state, int32_t n_soft, int32_t n_prompts,
                     const int32_t * post, const int64_t * post_off, const int32_t * post_len,
                     int32_t max_new, float temp, float top_p, int32_t top_k, uint64_t seed,
