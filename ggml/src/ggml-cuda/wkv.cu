@@ -65,6 +65,8 @@ static __global__ void rwkv_wkv_f32(const int B, const int T, const int C, const
     }
 }
 
+// a thread per row of the state; the vectors of the next token are loaded into registers while the current one is
+// computed, and go through a double buffer in shared memory (one barrier per token)
 template <int block_size>
 static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, const int H, const float * r, const float * w, const float * k, const float * v, const float * a, const float * b, const float * s, float * dst, float * s_out) {
     const int tid = threadIdx.x;
@@ -77,60 +79,63 @@ static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, cons
     const int n_seq_tokens = T / B;
 
     float state[head_size];
-    __shared__ float _r[head_size], _w[head_size], _k[head_size], _a[head_size], _b[head_size];
+    __shared__ float _r[2][head_size], _w[2][head_size], _k[2][head_size], _a[2][head_size], _b[2][head_size];
 
     #pragma unroll
     for (int i = 0; i < head_size; i++) {
         state[i] = s[batch_i * state_size + head_i * head_size * head_size + tid * head_size + i];
     }
 
-    for (int t = batch_i * n_seq_tokens * C + head_i * head_size + tid; t < (batch_i + 1) * n_seq_tokens * C + head_i * head_size + tid; t += C) {
+    const int t0 = batch_i * n_seq_tokens * C + head_i * head_size + tid;
+    const int t1 = t0 + n_seq_tokens * C;
+    float nr = 0, nw = 0, nk = 0, na = 0, nb = 0, nv = 0;
+    if (t0 < t1) {
+        nr = r[t0]; nw = w[t0]; nk = k[t0]; na = a[t0]; nb = b[t0]; nv = v[t0];
+    }
+    for (int t = t0, bf = 0; t < t1; t += C, bf ^= 1) {
+        _r[bf][tid] = nr;
+        _w[bf][tid] = nw;
+        _k[bf][tid] = nk;
+        _a[bf][tid] = na;
+        _b[bf][tid] = nb;
+        const float _v = nv;
         __syncthreads();
-        _r[tid] = r[t];
-        _w[tid] = w[t];
-        _k[tid] = k[t];
-        _a[tid] = a[t];
-        _b[tid] = b[t];
-        __syncthreads();
+        if (t + C < t1) {
+            nr = r[t + C]; nw = w[t + C]; nk = k[t + C]; na = a[t + C]; nb = b[t + C]; nv = v[t + C];
+        }
 
-        float sa = 0;
+        float sa4[4] = { 0, 0, 0, 0 };
         #pragma unroll
-        for (int j = 0; j < head_size; j += 4)
-        {
-            const float4& a = (float4&)(_a[j]);
-            const float4& s = (float4&)(state[j]);
-            sa += a.x * s.x;
-            sa += a.y * s.y;
-            sa += a.z * s.z;
-            sa += a.w * s.w;
-        }
-
-        const float _v = v[t];
-        float y = 0;
         for (int j = 0; j < head_size; j += 4) {
-            const float4& r = (float4&)(_r[j]);
-            const float4& w = (float4&)(_w[j]);
-            const float4& k = (float4&)(_k[j]);
-            const float4& b = (float4&)(_b[j]);
-            float4& s = (float4&)(state[j]);
-            float4 kv;
-
-            kv.x = k.x * _v;
-            kv.y = k.y * _v;
-            kv.z = k.z * _v;
-            kv.w = k.w * _v;
-
-            s.x = s.x * w.x + kv.x + sa * b.x;
-            s.y = s.y * w.y + kv.y + sa * b.y;
-            s.z = s.z * w.z + kv.z + sa * b.z;
-            s.w = s.w * w.w + kv.w + sa * b.w;
-
-            y += s.x * r.x;
-            y += s.y * r.y;
-            y += s.z * r.z;
-            y += s.w * r.w;
+            const float4 & a = (float4 &) (_a[bf][j]);
+            const float4 & s = (float4 &) (state[j]);
+            sa4[0] += a.x * s.x;
+            sa4[1] += a.y * s.y;
+            sa4[2] += a.z * s.z;
+            sa4[3] += a.w * s.w;
         }
-        dst[t] = y;
+        const float sa = (sa4[0] + sa4[1]) + (sa4[2] + sa4[3]);
+
+        float y4[4] = { 0, 0, 0, 0 };
+        #pragma unroll
+        for (int j = 0; j < head_size; j += 4) {
+            const float4 & r = (float4 &) (_r[bf][j]);
+            const float4 & w = (float4 &) (_w[bf][j]);
+            const float4 & k = (float4 &) (_k[bf][j]);
+            const float4 & b = (float4 &) (_b[bf][j]);
+            float4 & s = (float4 &) (state[j]);
+
+            s.x = s.x * w.x + k.x * _v + sa * b.x;
+            s.y = s.y * w.y + k.y * _v + sa * b.y;
+            s.z = s.z * w.z + k.z * _v + sa * b.z;
+            s.w = s.w * w.w + k.w * _v + sa * b.w;
+
+            y4[0] += s.x * r.x;
+            y4[1] += s.y * r.y;
+            y4[2] += s.z * r.z;
+            y4[3] += s.w * r.w;
+        }
+        dst[t] = (y4[0] + y4[1]) + (y4[2] + y4[3]);
     }
 
     #pragma unroll
