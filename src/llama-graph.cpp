@@ -4009,6 +4009,11 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
             inp, token_shift_all,
             hparams.n_embd_r(), n_seqs);
 
+    // read in place, the rows would be overwritten by the store of the new token shift before the channel mix reads them
+    if (inp->in_place) {
+        token_shift = ggml_cont(ctx0, token_shift);
+    }
+
     token_shift = ggml_reshape_3d(ctx0, token_shift, hparams.n_embd, token_shift_count, n_seqs);
 
     return token_shift;
