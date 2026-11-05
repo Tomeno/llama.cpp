@@ -49,6 +49,7 @@ struct sp_ctx {
     int32_t n_seq       = 1;  // sequences of the context
     int32_t n_batch     = 0;
     int32_t n_threads   = 1;
+    int32_t grad_seqs   = 1;  // sp_state_grad: sequences per decode
 
     std::vector<llama_token> before;
     std::vector<float>       init; // recurrent state before the prefix (empty: zero)
@@ -619,6 +620,10 @@ SP_API void sp_set_grad_ckpt(sp_ctx * c, int32_t n_layers) {
     llama_set_state_grad_ckpt(c->ctx, n_layers);
 }
 
+SP_API void sp_set_grad_seqs(sp_ctx * c, int32_t n_seqs) {
+    c->grad_seqs = std::max(1, n_seqs);
+}
+
 SP_API int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_idx, int32_t n_jobs,
                              const int32_t * post, const int64_t * post_off, const int32_t * post_len,
                              const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
@@ -635,53 +640,77 @@ SP_API int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * s
 
         llama_set_logprobs(c->ctx, temp);
         llama_set_state_grad(c->ctx, true);
-        // one sequence per decode: the whole sequence has to be in one ubatch
+
+        // every sequence has to be in one ubatch: up to grad_seqs jobs of similar length per decode, the shorter ones
+        // padded at the end (no outputs, no weights) to the longest
+        std::vector<int> len(n_jobs), order(n_jobs);
         for (int j = 0; j < n_jobs; ++j) {
             if (post_len[j] < 1 || resp_len[j] < 1) {
                 throw std::runtime_error("every job needs at least one prompt and one response token");
             }
-            const int n = post_len[j] + resp_len[j] - 1; // the last response token is only a target
-            if (n > c->n_batch) {
-                throw std::runtime_error("job " + std::to_string(j) + ": " + std::to_string(n) + " tokens, more than the batch size");
+            len[j] = post_len[j] + resp_len[j] - 1; // the last response token is only a target
+            if (len[j] > c->n_batch) {
+                throw std::runtime_error("job " + std::to_string(j) + ": " + std::to_string(len[j]) + " tokens, more than the batch size");
+            }
+            order[j] = j;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return len[a] > len[b]; });
+
+        const int max_seqs = std::max(1, std::min(c->grad_seqs, c->n_seq));
+        for (size_t g0 = 0; g0 < order.size(); ) {
+            const int L = len[order[g0]];
+            size_t g1 = g0 + 1;
+            while (g1 < order.size() && (int) (g1 - g0) < max_seqs && (int64_t) (g1 - g0 + 1) * L <= c->n_batch) {
+                ++g1;
             }
             llama_memory_clear(mem, true);
-            if (!llama_memory_seq_seed(c->ctx, 0)) {
-                throw std::runtime_error("failed to seed sequence 0");
-            }
-            const float * st = states + (size_t) state_idx[j]*c->n_state;
-            set_state(c, 0, st);
-
-            std::vector<llama_token> toks(post + post_off[j], post + post_off[j] + post_len[j]);
-            toks.insert(toks.end(), resp + resp_off[j], resp + resp_off[j] + resp_len[j]);
-
-            const int s0 = post_len[j] - 1;
             std::vector<sp_item>     items;
             std::vector<llama_token> targets;
             std::vector<float>       weights;
-            for (int i = 0; i < n; ++i) {
-                const bool out = i >= s0;
-                items.push_back({ 0, toks[i], i, out });
-                targets.push_back(out ? toks[i + 1] : 0);
-                weights.push_back(out ? w[resp_off[j] + i - s0] : 0.0f);
+            std::vector<int>         first(g1 - g0); // batch index of the first token of every sequence
+            for (size_t q = g0; q < g1; ++q) {
+                const int j = order[q];
+                const llama_seq_id s = (llama_seq_id) (q - g0);
+                if (!llama_memory_seq_seed(c->ctx, s)) {
+                    throw std::runtime_error("failed to seed sequence " + std::to_string(s));
+                }
+                set_state(c, s, states + (size_t) state_idx[j]*c->n_state);
+
+                std::vector<llama_token> toks(post + post_off[j], post + post_off[j] + post_len[j]);
+                toks.insert(toks.end(), resp + resp_off[j], resp + resp_off[j] + resp_len[j]);
+                const int s0 = post_len[j] - 1;
+                first[s] = (int) items.size();
+                for (int i = 0; i < L; ++i) {
+                    const bool out = i >= s0 && i < len[j];
+                    items.push_back({ s, toks[std::min(i, len[j] - 1)], i, out });
+                    targets.push_back(out ? toks[i + 1] : 0);
+                    weights.push_back(out ? w[resp_off[j] + i - s0] : 0.0f);
+                }
             }
             llama_set_logprob_targets(c->ctx, targets.data(), (int32_t) targets.size());
             llama_set_state_grad_weights(c->ctx, weights.data(), (int32_t) weights.size());
             decode_items(c, items);
 
-            for (int i = s0; i < n; ++i) {
-                logp[resp_off[j] + i - s0] = llama_get_logprob_ith(c->ctx, i);
-            }
-            float * dst = grad + (size_t) state_idx[j]*c->n_state;
-            for (auto [il, ns] : c->state_layers) {
-                g.resize(ns);
-                if (llama_get_state_grad(c->ctx, 0, il, g.data()) != ns) {
-                    throw std::runtime_error("no state gradient for layer " + std::to_string(il));
+            for (size_t q = g0; q < g1; ++q) {
+                const int j = order[q];
+                const llama_seq_id s = (llama_seq_id) (q - g0);
+                const int s0 = post_len[j] - 1;
+                for (int i = s0; i < len[j]; ++i) {
+                    logp[resp_off[j] + i - s0] = llama_get_logprob_ith(c->ctx, first[s] + i);
                 }
-                for (int64_t k = 0; k < ns; ++k) {
-                    dst[k] += g[k];
+                float * dst = grad + (size_t) state_idx[j]*c->n_state;
+                for (auto [il, ns] : c->state_layers) {
+                    g.resize(ns);
+                    if (llama_get_state_grad(c->ctx, s, il, g.data()) != ns) {
+                        throw std::runtime_error("no state gradient for layer " + std::to_string(il));
+                    }
+                    for (int64_t k = 0; k < ns; ++k) {
+                        dst[k] += g[k];
+                    }
+                    dst += ns;
                 }
-                dst += ns;
             }
+            g0 = g1;
         }
         llama_set_state_grad(c->ctx, false);
         llama_set_logprobs(c->ctx, 0.0f);

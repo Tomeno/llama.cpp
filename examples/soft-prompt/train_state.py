@@ -69,6 +69,8 @@ def main():
                     help="--opt grad: prompt + response tokens per sequence, longer responses are cut (GPU memory)")
     ap.add_argument("--ckpt", type=int, default=4,
                     help="--opt grad: gradient checkpointing, layers per segment (0: off, ~16 MB of GPU memory per token)")
+    ap.add_argument("--grad-seqs", type=int, default=1,
+                    help="--opt grad: sequences per backward pass, padded to the longest (-b must hold them together)")
     rollout.add_sampling_args(ap)
     rewards.add_reward_args(ap)
     args = ap.parse_args()
@@ -83,6 +85,7 @@ def main():
     eng, theta, tpl = setup(args, n_seq=args.par if args.opt == "grad" else max(args.par, 2 * args.pairs))
     if args.opt == "grad":
         eng.set_grad_ckpt(args.ckpt)
+        eng.set_grad_seqs(args.grad_seqs)
     args.init_file = init_file
     head = state_head_dim(args.model)
     if eng.n_state == 0 or eng.n_state % (head * head):

@@ -39,6 +39,9 @@ int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, int32_t
 // cleared); logp gets the log-probs (laid out as resp, w too). Every job must fit in one batch.
 // sp_state_grad with gradient checkpointing in segments of n_layers layers (0: off)
 void    sp_set_grad_ckpt(sp_ctx * c, int32_t n_layers);
+// sp_state_grad decodes up to n_seqs jobs of similar length at once (default 1), padded to the longest; all of them must fit
+// in one batch together
+void    sp_set_grad_seqs(sp_ctx * c, int32_t n_seqs);
 
 int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_idx, int32_t n_jobs,
                       const int32_t * post, const int64_t * post_off, const int32_t * post_len,
