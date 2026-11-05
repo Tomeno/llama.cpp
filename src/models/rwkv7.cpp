@@ -144,7 +144,8 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         v_first = ggml_view_2d(ctx0, seg_inp, hparams.n_embd, n_tokens, seg_inp->nb[1], seg_inp->nb[2]);
     } else {
         inpL = build_inp_embd(model.tok_embd);
-        inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, 0);
+        inpL = rwkv7_fused(model.layers[0]) ? ggml_rwkv7_ln(ctx0, inpL, model.tok_norm, model.tok_norm_b, hparams.f_norm_eps)
+                                            : build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, 0);
     }
 
     auto * rs_inp = build_rs_inp();
@@ -166,11 +167,12 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         ggml_tensor * ffn_shift = ggml_view_3d(ctx0, token_shift, n_embd, 1, n_seqs, token_shift->nb[1],
                                                token_shift->nb[2], n_embd * ggml_element_size(token_shift));
 
-        ggml_tensor * att_norm = build_norm(inpL, layer->attn_norm, layer->attn_norm_b, LLM_NORM, il);
-        cb(att_norm, "attn_norm", il);
-
         // the fused ops take the token shift itself
         const bool fused = rwkv7_fused(*layer);
+
+        ggml_tensor * att_norm = fused ? ggml_rwkv7_ln(ctx0, inpL, layer->attn_norm, layer->attn_norm_b, hparams.f_norm_eps)
+                                       : build_norm(inpL, layer->attn_norm, layer->attn_norm_b, LLM_NORM, il);
+        cb(att_norm, "attn_norm", il);
 
         ggml_tensor * x_prev = fused ? nullptr : ggml_concat(
             ctx0, att_shift,
@@ -181,7 +183,8 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
 
-        ggml_tensor * ffn_norm = build_norm(ffn_inp, layer->attn_norm_2, layer->attn_norm_2_b, LLM_NORM, il);
+        ggml_tensor * ffn_norm = fused ? ggml_rwkv7_ln(ctx0, ffn_inp, layer->attn_norm_2, layer->attn_norm_2_b, hparams.f_norm_eps)
+                                       : build_norm(ffn_inp, layer->attn_norm_2, layer->attn_norm_2_b, LLM_NORM, il);
         cb(ffn_norm, "ffn_norm", il);
 
         // fused: the lerp of the channel mix instead of x_prev
@@ -213,7 +216,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
                 ffn_inp = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
                 xk      = ggml_get_rows(ctx0, xk, inp_out_ids);
             }
-            cur = build_lora_mm(layer->channel_mix_value, ggml_sqr(ctx0, ggml_relu(ctx0, build_lora_mm(layer->channel_mix_key, xk))));
+            cur = build_lora_mm(layer->channel_mix_value, ggml_rwkv7_relu2(ctx0, build_lora_mm(layer->channel_mix_key, xk)));
         } else {
             x_prev = ggml_reshape_2d(ctx0, x_prev, n_embd, n_tokens);
             if (il == n_layer - 1 && inp_out_ids) {
@@ -249,7 +252,8 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
         return;
     }
 
-    cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
+    cur = rwkv7_fused(model.layers[0]) ? ggml_rwkv7_ln(ctx0, cur, model.output_norm, model.output_norm_b, hparams.f_norm_eps)
+                                       : build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
