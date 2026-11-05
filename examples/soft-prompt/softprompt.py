@@ -307,6 +307,14 @@ def load_soft_prompt(path: str) -> tuple[np.ndarray, Template, dict]:
     return theta, tpl, meta
 
 
+def state_head_dim(model: str) -> int:
+    """Side of the square recurrent state matrices: the wkv head size of RWKV, else 128 (EdgeRock delta-net heads)."""
+    r = gguf.GGUFReader(model)
+    arch = r.fields["general.architecture"].contents()
+    f = r.fields.get(f"{arch}.wkv.head_size")
+    return int(f.contents()) if f is not None else 128
+
+
 def read_jsonl(path: str) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Initial state tuning: tunes the recurrent state after the prompt prefix (EdgeRock / Qwen3.5: the delta-net matrices,
-24 layers x 32 heads x 128 x 128 = 12.6M values) on the NLL of target responses, with antithetic ES + Adam.
+24 layers x 32 heads x 128 x 128 = 12.6M values; RWKV7 2.9B: the wkv matrices, 32 layers x 40 heads x 64 x 64 = 5.2M)
+on the NLL of target responses, with antithetic ES + Adam.
 
 The soft prompt (or text) prefix stays fixed and is processed as usual; its recurrent state is then replaced by
     state = s0 + scale * z
@@ -14,7 +15,8 @@ the starting state; only the tokens after the shared prefix are scored. The resu
 generate.py use it with --init-file).
 
 With --no-soft-prompt there is no prefix at all (no soft prompt, no before / after text): the state is the initial state
-of the model, before the first token of the prompt; s0 is zero then, so the scales come from the state of the --init-file.
+of the model, before the first token of the prompt; s0 is zero then, so the scales come from the state of the --init-file
+or, without one (start from the model's own zero state), from the state the model reaches after --scale-text.
 
 --opt grad (with --no-soft-prompt) replaces ES by the exact gradient (backpropagation through the model, llama.cpp's
 state-gradient mode) and Adam on the same parameters and loss: every step is one backward pass per example and per fork
@@ -36,12 +38,9 @@ import numpy as np
 import es as es_mod
 import rewards
 import rollout
-from softprompt import add_common_args, load_state, read_jsonl, save_state, setup
+from softprompt import add_common_args, load_state, read_jsonl, save_state, setup, state_head_dim
 import dpo
 from train_nll import load, nll
-
-HEAD = 128  # head_v_dim: the state of a head is HEAD x HEAD
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -60,6 +59,8 @@ def main():
     ap.add_argument("--beta", type=float, default=0.1)
     ap.add_argument("--w-fork", type=float, default=1.0, help="weight of the fork DPO term")
     ap.add_argument("--scale-floor", type=float, default=0.1, help="minimum head scale, relative to the median")
+    ap.add_argument("--scale-text", help="--no-soft-prompt without an --init-file state: the head scales are those of the "
+                    "state after this text (the tuning starts from the zero state)")
     ap.add_argument("--no-soft-prompt", action="store_true",
                     help="no prefix: tune the initial state before the prompt (from the state of --init-file, if any)")
     ap.add_argument("--opt", choices=["es", "grad"], default="es",
@@ -83,21 +84,29 @@ def main():
     if args.opt == "grad":
         eng.set_grad_ckpt(args.ckpt)
     args.init_file = init_file
-    if eng.n_state == 0 or eng.n_state % (HEAD * HEAD):
-        sys.exit(f"the model has {eng.n_state} recurrent state values, not a stack of {HEAD} x {HEAD} matrices")
-    s0 = eng.get_state(theta).reshape(-1, HEAD, HEAD)
+    head = state_head_dim(args.model)
+    if eng.n_state == 0 or eng.n_state % (head * head):
+        sys.exit(f"the model has {eng.n_state} recurrent state values, not a stack of {head} x {head} matrices")
+    s0 = eng.get_state(theta).reshape(-1, head, head)
     st0 = load_state(args.init_file)
-    if args.no_soft_prompt and st0 is None:
-        sys.exit("--no-soft-prompt needs an --init-file with a state (the scales come from it)")
-    # without a prefix s0 is zero: the scales of the starting state instead
-    ref = st0.reshape(s0.shape) if args.no_soft_prompt and st0 is not None else s0
+    ref = s0
+    if args.no_soft_prompt:
+        # without a prefix s0 is zero: the scales of the starting state, or of the state after --scale-text
+        if st0 is not None:
+            ref = st0.reshape(s0.shape)
+        elif args.scale_text:
+            eng.set_before(eng.tokenize(args.scale_text))
+            ref = eng.get_state(theta).reshape(s0.shape)
+            eng.set_before([])
+        else:
+            sys.exit("--no-soft-prompt needs an --init-file with a state or --scale-text (the scales come from it)")
     scale = np.sqrt(np.mean(np.square(ref, dtype=np.float64), axis=(1, 2))).astype(np.float32)
     scale = np.maximum(scale, args.scale_floor * float(np.median(scale)))
     print(f"state: {len(s0)} matrices, head scale median {np.median(scale):.2e}, min {scale.min():.2e}, max {scale.max():.2e}",
           file=sys.stderr)
 
     def states(z: np.ndarray) -> np.ndarray:
-        """[n, n_state] from parameters [n, M, HEAD, HEAD]"""
+        """[n, n_state] from parameters [n, M, head, head]"""
         return (s0 + scale[:, None, None] * z).reshape(len(z), -1)
 
     train = load(eng, tpl, args.train, args.max_resp)
