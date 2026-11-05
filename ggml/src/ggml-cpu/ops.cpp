@@ -12229,6 +12229,46 @@ static void ggml_compute_forward_rwkv7_f32(const ggml_compute_params * params, g
                 }
             }
         } break;
+        case GGML_RWKV7_OP_LN: {
+            const float * x = F(0), * lw = F(1), * lb = F(2);
+            for (int64_t t = r0; t < r1; ++t) {
+                const float * xr = x + t*C;
+                double mean = 0.0, var = 0.0;
+                for (int64_t c = 0; c < C; ++c) {
+                    mean += xr[c];
+                }
+                mean /= C;
+                for (int64_t c = 0; c < C; ++c) {
+                    var += (xr[c] - mean) * (xr[c] - mean);
+                }
+                const float rstd = 1.0f / sqrtf((float) (var / C) + eps);
+                if (!back) {
+                    for (int64_t c = 0; c < C; ++c) {
+                        d[t*C + c] = (float) (xr[c] - mean) * rstd * lw[c] + lb[c];
+                    }
+                    continue;
+                }
+                double s_dn = 0.0, s_dnn = 0.0;
+                for (int64_t c = 0; c < C; ++c) {
+                    const float dn = gr[t*C + c] * lw[c];
+                    s_dn  += dn;
+                    s_dnn += dn * (float) (xr[c] - mean) * rstd;
+                }
+                for (int64_t c = 0; c < C; ++c) {
+                    const float xn = (float) (xr[c] - mean) * rstd;
+                    d[t*C + c] = (gr[t*C + c] * lw[c] - (float) (s_dn / C) - xn * (float) (s_dnn / C)) * rstd;
+                }
+            }
+        } break;
+        case GGML_RWKV7_OP_RELU2: {
+            const float * x = F(0);
+            for (int64_t t = r0; t < r1; ++t) {
+                for (int64_t c = 0; c < C; ++c) {
+                    const float r = fmaxf(x[t*C + c], 0.0f);
+                    d[t*C + c] = back ? 2.0f * r * gr[t*C + c] : r * r;
+                }
+            }
+        } break;
         default:
             GGML_ABORT("fatal error");
     }

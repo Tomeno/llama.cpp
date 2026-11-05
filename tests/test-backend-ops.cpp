@@ -5372,6 +5372,8 @@ struct test_rwkv7 : public test_case {
             case GGML_RWKV7_OP_OUT:
                 out = ggml_rwkv7_out(ctx, act(), act(), act(), act(), act(), wgt(), wgt(), wgt(), N, 64e-5f);
                 break;
+            case GGML_RWKV7_OP_LN:    out = ggml_rwkv7_ln(ctx, act(), wgt(), wgt(), 1e-5f); break;
+            case GGML_RWKV7_OP_RELU2: out = ggml_rwkv7_relu2(ctx, act()); break;
             default: GGML_ABORT("fatal error");
         }
         if (!back) {

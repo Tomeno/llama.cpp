@@ -6167,8 +6167,27 @@ struct ggml_tensor * ggml_rwkv7_out(
     return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_OUT, ne, srcs, 8, head_size, eps);
 }
 
+struct ggml_tensor * ggml_rwkv7_ln(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * b,
+        float                 eps) {
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_nelements(w) == x->ne[0] && ggml_nelements(b) == x->ne[0]);
+    struct ggml_tensor * srcs[3] = { x, w, b };
+    return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_LN, x->ne, srcs, 3, 0, eps);
+}
+
+struct ggml_tensor * ggml_rwkv7_relu2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(ggml_is_contiguous(x));
+    struct ggml_tensor * srcs[1] = { x };
+    return ggml_rwkv7_impl(ctx, GGML_RWKV7_OP_RELU2, x->ne, srcs, 1, 0, 0.0f);
+}
+
 // the gradients of the inputs of an RWKV7 node for the gradient of its result, packed (see the CPU / CUDA kernels):
-// LERP [dx, dshift], KKA [dk, da], VRES [dv, dv_first, dv12], DECAY [dw], OUT [dy, dr, dk, dv, dg]
+// LERP [dx, dshift], KKA [dk, da], VRES [dv, dv_first, dv12], DECAY [dw], OUT [dy, dr, dk, dv, dg], LN [dx], RELU2 [dx]
 struct ggml_tensor * ggml_rwkv7_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * fwd,
@@ -6182,6 +6201,8 @@ struct ggml_tensor * ggml_rwkv7_back(
         case GGML_RWKV7_OP_VRES:  ne[1] = fwd->ne[1]; ne[2] = 3; break;
         case GGML_RWKV7_OP_DECAY: ne[1] = fwd->ne[1]; break;
         case GGML_RWKV7_OP_OUT:   ne[1] = fwd->ne[1]; ne[2] = 5; break;
+        case GGML_RWKV7_OP_LN:
+        case GGML_RWKV7_OP_RELU2: memcpy(ne, fwd->ne, sizeof(ne)); break;
         default: GGML_ABORT("fatal error");
     }
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -7647,6 +7668,8 @@ static void ggml_compute_backward(
                 case GGML_RWKV7_OP_VRES:  n_grad = 3; break;
                 case GGML_RWKV7_OP_DECAY: n_grad = 1; break;
                 case GGML_RWKV7_OP_OUT:   n_grad = 5; break;
+                case GGML_RWKV7_OP_LN:
+                case GGML_RWKV7_OP_RELU2: n_grad = 1; break;
                 default: GGML_ABORT("fatal error");
             }
             for (int j = 0; j < n_grad; ++j) {

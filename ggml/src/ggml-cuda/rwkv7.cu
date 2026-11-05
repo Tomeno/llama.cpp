@@ -196,6 +196,66 @@ static __global__ void rwkv7_out_f32(const float * y, const float * r, const flo
     }
 }
 
+// LN: one block per row
+template <bool back>
+static __global__ void rwkv7_ln_f32(const float * x, const float * lw, const float * lb, const float * gr, float * d,
+        const int64_t C, const float eps) {
+    const int64_t row = blockIdx.x;
+    const float * xr = x + row*C;
+    __shared__ float buf[32];
+    auto block_sum = [&](float v) {
+        v = warp_reduce_sum(v);
+        __syncthreads();
+        if (threadIdx.x % WARP_SIZE == 0) {
+            buf[threadIdx.x / WARP_SIZE] = v;
+        }
+        __syncthreads();
+        const int lane = threadIdx.x % WARP_SIZE;
+        v = lane < (int) (blockDim.x / WARP_SIZE) ? buf[lane] : 0.0f;
+        return warp_reduce_sum(v);
+    };
+    float sum = 0.0f;
+    for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+        sum += xr[c];
+    }
+    const float mean = block_sum(sum) / C;
+    float var = 0.0f;
+    for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+        const float y = xr[c] - mean;
+        var += y*y;
+    }
+    const float rstd = rsqrtf(block_sum(var) / C + eps);
+    if (!back) {
+        for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+            d[row*C + c] = (xr[c] - mean) * rstd * lw[c] + lb[c];
+        }
+        return;
+    }
+    const float * g = gr + row*C;
+    float s_dn = 0.0f, s_dnn = 0.0f;
+    for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+        const float dn = g[c] * lw[c];
+        s_dn  += dn;
+        s_dnn += dn * (xr[c] - mean) * rstd;
+    }
+    s_dn  = block_sum(s_dn) / C;
+    s_dnn = block_sum(s_dnn) / C;
+    for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+        const float xn = (xr[c] - mean) * rstd;
+        d[row*C + c] = (g[c] * lw[c] - s_dn - xn * s_dnn) * rstd;
+    }
+}
+
+template <bool back>
+static __global__ void rwkv7_relu2_f32(const float * x, const float * gr, float * d, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float r = fmaxf(x[i], 0.0f);
+    d[i] = back ? 2.0f * r * gr[i] : r * r;
+}
+
 template <int E, bool back>
 static void rwkv7_heads(const ggml_tensor * dst, cudaStream_t stream, const float * const * S, const float * gr, float * d,
         int64_t C, int64_t T, float eps) {
@@ -236,6 +296,12 @@ static void rwkv7_op(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_RWKV7_OP_DECAY:
             rwkv7_decay_f32<back><<<nb, bs, 0, stream>>>(S[0], S[1], gr, d, C, C*T);
+            break;
+        case GGML_RWKV7_OP_LN:
+            rwkv7_ln_f32<back><<<T, 256, 0, stream>>>(S[0], S[1], S[2], gr, d, C, eps);
+            break;
+        case GGML_RWKV7_OP_RELU2:
+            rwkv7_relu2_f32<back><<<nb, bs, 0, stream>>>(S[0], gr, d, C*T);
             break;
         case GGML_RWKV7_OP_KKA:
         case GGML_RWKV7_OP_OUT:

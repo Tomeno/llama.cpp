@@ -642,6 +642,8 @@ extern "C" {
         GGML_RWKV7_OP_VRES,   // value residual mix
         GGML_RWKV7_OP_DECAY,  // decay w
         GGML_RWKV7_OP_OUT,    // group norm, bonus and gate of the wkv7 output
+        GGML_RWKV7_OP_LN,     // layer norm with weight and bias
+        GGML_RWKV7_OP_RELU2,  // relu(x)^2
 
         GGML_RWKV7_OP_COUNT,
     };
@@ -2710,10 +2712,23 @@ extern "C" {
             int                   head_size,
             float                 eps);
 
+    // x (rows of C), w, b [C] -> norm(x) * w + b per row, the shape of x
+    GGML_API struct ggml_tensor * ggml_rwkv7_ln(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    // relu(x)^2, the shape of x
+    GGML_API struct ggml_tensor * ggml_rwkv7_relu2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x);
+
     GGML_API enum ggml_rwkv7_op ggml_get_rwkv7_op(const struct ggml_tensor * tensor);
 
     // the gradients of the inputs of an RWKV7 node fwd for the gradient grad of its result, packed:
-    // LERP [dx, dshift], KKA [dk, da], VRES [dv, dv_first, dv12], DECAY [dw], OUT [dy, dr, dk, dv, dg]
+    // LERP [dx, dshift], KKA [dk, da], VRES [dv, dv_first, dv12], DECAY [dw], OUT [dy, dr, dk, dv, dg], LN [dx], RELU2 [dx]
     GGML_API struct ggml_tensor * ggml_rwkv7_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * fwd,
