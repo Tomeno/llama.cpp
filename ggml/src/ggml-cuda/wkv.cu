@@ -252,18 +252,25 @@ void ggml_cuda_op_rwkv_wkv7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     }
 }
 
-// backward pass of rwkv_wkv7: one block per (sequence, head), thread i holds row i of the state (and of its gradient);
-// a forward pass keeps the state every CH tokens (ck), then every chunk is recomputed from its checkpoint and
-// backpropagated, the last one first; the sums over the rows go through shared memory
-template <int N, int CH>
-static __global__ void rwkv_wkv7_back_f32(const int T, const int Ts, const int C, const int H,
+// backward pass of rwkv_wkv7: one block per (sequence, head), Q threads per row of the state (E = N/Q columns each)
+// - forward: the state every CK tokens (ck) and S a of every token and row (sa) to the scratch
+// - backward, the last token first: the state before token t from the one after it,
+//   S_{t-1} = (S_t - v k^T - sa b^T) / w (w >= exp(-0.606531)), exact again at every checkpoint, so the rounding grows
+//   by at most w^-(CK-1); the sums over the rows (the gradients of r, w, k, a, b) go through shared memory.
+// The per-token vectors of the next token are loaded into registers while the current one is computed (double buffer).
+template <int N, int Q, int CK>
+static __global__ void __launch_bounds__(N * Q, 1) rwkv_wkv7_back_f32(const int T, const int Ts, const int C, const int H,
         const float * r, const float * w, const float * k, const float * v, const float * a, const float * b,
-        const float * s0, const float * gy, float * d, float * ck) {
-    const int i   = threadIdx.x;
+        const float * s0, const float * gy, float * d, float * ck, float * sa_buf) {
+    constexpr int E  = N / Q;
+    constexpr int NV = 7; // r, w, k, a, b, v, dy
+    const int tid = threadIdx.x;
+    const int i   = tid / Q;      // row
+    const int q   = tid % Q;      // columns q*E .. q*E + E - 1
     const int bid = blockIdx.x;
     const int bi  = bid / H;
     const int h   = bid % H;
-    const int n_ch = (Ts + CH - 1) / CH;
+    const int n_ck = (Ts + CK - 1) / CK;
 
     const float * gs = gy + (int64_t) C * T;
     float * dr = d;
@@ -274,127 +281,191 @@ static __global__ void rwkv_wkv7_back_f32(const int T, const int Ts, const int C
     float * db = d + (int64_t) 5 * C * T;
     float * ds = d + (int64_t) 6 * C * T;
 
-    const int64_t so = (int64_t) bi * C * N + (int64_t) h * N * N + (int64_t) i * N;
-    float * ckb = ck + (int64_t) bid * n_ch * N * N + (int64_t) i * N;
+    const int64_t so = (int64_t) bi * C * N + (int64_t) h * N * N + (int64_t) i * N + q * E;
+    float * ckb = ck + (int64_t) bid * n_ck * N * N + (int64_t) i * N + q * E;
+    float * sab = sa_buf + (int64_t) bid * Ts * N;
+    const float * src[NV] = { r, w, k, a, b, v, gy };
+    auto off = [&](int t) { return ((int64_t) bi * Ts + t) * C + h * N; };
 
-    __shared__ float _r[N], _w[N], _k[N], _a[N], _b[N], _v[N], _dy[N], _sa[N], _dsa[N];
+    __shared__ float vec[2][NV][N];
+    __shared__ float winv[2][N]; // 1 / w
+    __shared__ float _sa[N], _dsa[N];
     __shared__ float shS[N][N + 1], shG[N][N + 1];
+    __shared__ float red[Q][5][N];
 
-    float S[N], G[N];
-    float Sb[CH][N];
-    float sab[CH];
+    float S[E], G[E], nxt[NV];
 
-    auto load = [&](int64_t o) {
-        __syncthreads();
-        _r[i] = r[o + i];
-        _w[i] = w[o + i];
-        _k[i] = k[o + i];
-        _a[i] = a[o + i];
-        _b[i] = b[o + i];
-        _v[i] = v[o + i];
-        _dy[i] = gy[o + i];
-        __syncthreads();
+    // reduction over the Q threads of a row (consecutive lanes)
+    auto row_sum = [](float x) {
+#pragma unroll
+        for (int o = Q / 2; o > 0; o >>= 1) {
+            x += __shfl_xor_sync(0xffffffff, x, o, Q);
+        }
+        return x;
     };
-    // S <- S w + v k + sa b, returns sa
-    auto step = [&]() {
+    // the vectors of token t: threads tid < N load element tid of each into registers, then store them to buffer bf
+    auto fetch = [&](int t) {
+        if (tid < N && t >= 0 && t < Ts) {
+            const int64_t o = off(t);
+#pragma unroll
+            for (int x = 0; x < NV; ++x) {
+                nxt[x] = src[x][o + tid];
+            }
+        }
+    };
+    auto store = [&](int bf) {
+        if (tid < N) {
+#pragma unroll
+            for (int x = 0; x < NV; ++x) {
+                vec[bf][x][tid] = nxt[x];
+            }
+            winv[bf][tid] = 1.0f / nxt[1];
+        }
+    };
+
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+        S[e] = s0[so + e];
+    }
+    fetch(0);
+    store(0);
+    __syncthreads();
+    for (int t = 0; t < Ts; ++t) {
+        const int bf = t & 1;
+        fetch(t + 1);
+        const float * _w = vec[bf][1], * _k = vec[bf][2], * _a = vec[bf][3], * _b = vec[bf][4];
+        if (t % CK == 0) {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                ckb[(int64_t) (t / CK) * N * N + e] = S[e];
+            }
+        }
         float sa = 0.0f;
 #pragma unroll
-        for (int j = 0; j < N; ++j) {
-            sa += S[j] * _a[j];
+        for (int e = 0; e < E; ++e) {
+            sa += S[e] * _a[q * E + e];
         }
-        const float vi = _v[i];
-#pragma unroll
-        for (int j = 0; j < N; ++j) {
-            S[j] = S[j] * _w[j] + vi * _k[j] + sa * _b[j];
+        sa = row_sum(sa);
+        if (q == 0) {
+            sab[(int64_t) t * N + i] = sa;
         }
-        return sa;
-    };
-
+        const float vi = vec[bf][5][i];
 #pragma unroll
-    for (int j = 0; j < N; ++j) {
-        S[j] = s0[so + j];
-    }
-    for (int t = 0; t < Ts; ++t) {
-        if (t % CH == 0) {
-#pragma unroll
-            for (int j = 0; j < N; ++j) {
-                ckb[(int64_t) (t / CH) * N * N + j] = S[j];
-            }
+        for (int e = 0; e < E; ++e) {
+            const int j = q * E + e;
+            S[e] = S[e] * _w[j] + vi * _k[j] + sa * _b[j];
         }
-        load(((int64_t) bi * Ts + t) * C + h * N);
-        step();
+        store(bf ^ 1);
+        __syncthreads();
     }
 
+    // S: the final state
 #pragma unroll
-    for (int j = 0; j < N; ++j) {
-        G[j] = gs[so + j];
+    for (int e = 0; e < E; ++e) {
+        G[e] = gs[so + e];
     }
-    for (int c = n_ch - 1; c >= 0; --c) {
-        const int tb = c * CH;
-        const int te = min(Ts, tb + CH);
-#pragma unroll
-        for (int j = 0; j < N; ++j) {
-            S[j] = ckb[(int64_t) c * N * N + j];
+    fetch(Ts - 1);
+    store(0);
+    __syncthreads();
+    float sa_nxt = sab[(int64_t) (Ts - 1) * N + i];
+    for (int t = Ts - 1, n = 0; t >= 0; --t, ++n) {
+        const int bf = n & 1;
+        fetch(t - 1);
+        const float sa = sa_nxt;
+        if (t > 0) {
+            sa_nxt = sab[(int64_t) (t - 1) * N + i];
         }
-        for (int t = tb; t < te; ++t) {
-            load(((int64_t) bi * Ts + t) * C + h * N);
-#pragma unroll
-            for (int j = 0; j < N; ++j) {
-                Sb[t - tb][j] = S[j];
-            }
-            sab[t - tb] = step();
-        }
-        for (int t = te - 1; t >= tb; --t) {
-            const int64_t o = ((int64_t) bi * Ts + t) * C + h * N;
-            load(o);
-            const float dyi = _dy[i];
-            float dvi = 0.0f, dsai = 0.0f;
-#pragma unroll
-            for (int j = 0; j < N; ++j) {
-                G[j] += dyi * _r[j];
-                dvi  += G[j] * _k[j];
-                dsai += G[j] * _b[j];
-                shS[i][j] = Sb[t - tb][j];
-                shG[i][j] = G[j];
-            }
-            _sa[i]  = sab[t - tb];
-            _dsa[i] = dsai;
-            __syncthreads();
+        const int64_t o = off(t);
+        const float * _r = vec[bf][0], * _w = vec[bf][1], * _k = vec[bf][2], * _a = vec[bf][3], * _b = vec[bf][4];
+        const float * _v = vec[bf][5], * _dy = vec[bf][6], * _iw = winv[bf];
+        const float vi  = _v[i];
+        const float dyi = _dy[i];
 
-            // column i: sums over the rows
-            const float wj = _w[i], kj = _k[i], bj = _b[i];
-            float drj = 0.0f, dkj = 0.0f, dbj = 0.0f, dwj = 0.0f, daj = 0.0f;
-#pragma unroll 8
-            for (int q = 0; q < N; ++q) {
-                const float sp = shS[q][i];
-                const float g  = shG[q][i];
-                drj += (sp * wj + _v[q] * kj + _sa[q] * bj) * _dy[q];
-                dkj += g * _v[q];
-                dbj += g * _sa[q];
-                dwj += g * sp;
-                daj += _dsa[q] * sp;
+        // the state before token t
+        if (t % CK == 0) {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                S[e] = ckb[(int64_t) (t / CK) * N * N + e];
             }
-            dr[o + i] = drj;
-            dw[o + i] = dwj;
-            dk[o + i] = dkj;
+        } else {
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const int j = q * E + e;
+                S[e] = (S[e] - vi * _k[j] - sa * _b[j]) * _iw[j];
+            }
+        }
+
+        float dvi = 0.0f, dsai = 0.0f;
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const int j = q * E + e;
+            G[e] += dyi * _r[j];
+            dvi  += G[e] * _k[j];
+            dsai += G[e] * _b[j];
+            shS[i][j] = S[e];
+            shG[i][j] = G[e];
+        }
+        dvi  = row_sum(dvi);
+        dsai = row_sum(dsai);
+        if (q == 0) {
             dv[o + i] = dvi;
-            da[o + i] = daj;
-            db[o + i] = dbj;
+            _sa[i]  = sa;
+            _dsa[i] = dsai;
+        }
+        store(bf ^ 1);
+        __syncthreads();
+
+        // column j, rows p*N/Q .. (p+1)*N/Q - 1
+        {
+            const int j = tid % N;
+            const int p = tid / N;
+            const float wj = _w[j], kj = _k[j], bj = _b[j];
+            float drj = 0.0f, dkj = 0.0f, dbj = 0.0f, dwj = 0.0f, daj = 0.0f;
+#pragma unroll
+            for (int x = 0; x < N / Q; ++x) {
+                const int ii = p * (N / Q) + x;
+                const float sp = shS[ii][j];
+                const float g  = shG[ii][j];
+                drj += (sp * wj + _v[ii] * kj + _sa[ii] * bj) * _dy[ii];
+                dkj += g * _v[ii];
+                dbj += g * _sa[ii];
+                dwj += g * sp;
+                daj += _dsa[ii] * sp;
+            }
+            red[p][0][j] = drj;
+            red[p][1][j] = dwj;
+            red[p][2][j] = dkj;
+            red[p][3][j] = daj;
+            red[p][4][j] = dbj;
+        }
+        __syncthreads();
+        for (int idx = tid; idx < 5 * N; idx += N * Q) {
+            const int c = idx / N;
+            const int j = idx % N;
+            float x = 0.0f;
+#pragma unroll
+            for (int p = 0; p < Q; ++p) {
+                x += red[p][c][j];
+            }
+            float * dst = c == 0 ? dr : c == 1 ? dw : c == 2 ? dk : c == 3 ? da : db;
+            dst[o + j] = x;
+        }
 
 #pragma unroll
-            for (int j = 0; j < N; ++j) {
-                G[j] = G[j] * _w[j] + dsai * _a[j];
-            }
+        for (int e = 0; e < E; ++e) {
+            const int j = q * E + e;
+            G[e] = G[e] * _w[j] + dsai * _a[j];
         }
     }
 #pragma unroll
-    for (int j = 0; j < N; ++j) {
-        ds[so + j] = G[j];
+    for (int e = 0; e < E; ++e) {
+        ds[so + e] = G[e];
     }
 }
 
 void ggml_cuda_op_rwkv_wkv7_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    constexpr int CH = 16;
+    constexpr int Q  = 4;
+    constexpr int CK = 8;
 
     const int64_t B = dst->src[6]->ne[1];
     const int64_t T = dst->src[0]->ne[2];
@@ -402,15 +473,16 @@ void ggml_cuda_op_rwkv_wkv7_back(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t H = dst->src[0]->ne[1];
     const int64_t C = N * H;
     const int64_t Ts = T / B;
-    const int64_t n_ch = (Ts + CH - 1) / CH;
+    const int64_t n_ck = (Ts + CK - 1) / CK;
 
     GGML_ASSERT(dst->src[6]->type == GGML_TYPE_F32 && dst->src[7]->type == GGML_TYPE_F32);
     GGML_ASSERT(N == CUDA_WKV_BLOCK_SIZE);
 
-    ggml_cuda_pool_alloc<float> ck(ctx.pool(), B * H * n_ch * N * N);
+    ggml_cuda_pool_alloc<float> ck(ctx.pool(), B * H * n_ck * N * N);
+    ggml_cuda_pool_alloc<float> sa(ctx.pool(), B * H * Ts * N);
 
-    rwkv_wkv7_back_f32<CUDA_WKV_BLOCK_SIZE, CH><<<B * H, N, 0, ctx.stream()>>>(T, Ts, C, H,
+    rwkv_wkv7_back_f32<CUDA_WKV_BLOCK_SIZE, Q, CK><<<B * H, N * Q, 0, ctx.stream()>>>(T, Ts, C, H,
         (const float *) dst->src[0]->data, (const float *) dst->src[1]->data, (const float *) dst->src[2]->data,
         (const float *) dst->src[3]->data, (const float *) dst->src[4]->data, (const float *) dst->src[5]->data,
-        (const float *) dst->src[6]->data, (const float *) dst->src[7]->data, (float *) dst->data, ck.get());
+        (const float *) dst->src[6]->data, (const float *) dst->src[7]->data, (float *) dst->data, ck.get(), sa.get());
 }
