@@ -6,6 +6,8 @@ and per-layer metadata arrays are sliced. The default keeps the first and the la
 Qwen3.5 (one attention layer every 4) keeps the layer pattern: 3 delta-net layers + 1 attention (+ RMA) layer.
 
     python slice_model.py EdgeRock-4B-Q4_K_M.gguf EdgeRock-slice8.gguf --layers 0-3,28-31
+
+--f32 dequantizes every tensor to F32 (exact forward passes, e.g. for finite-difference checks of gradients).
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ def main():
     ap.add_argument("input")
     ap.add_argument("output")
     ap.add_argument("--layers", default=None, help="kept blocks, e.g. 0-3,28-31 (default: first and last 4)")
+    ap.add_argument("--f32", action="store_true", help="dequantize every tensor to F32")
     args = ap.parse_args()
 
     r = gguf.GGUFReader(args.input)
@@ -70,16 +73,21 @@ def main():
             name = f"blk.{remap[i]}.{m.group(2)}"
         else:
             name = t.name
-        tensors.append((name, t))
-        w.add_tensor_info(name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
+        if args.f32:
+            data = np.ascontiguousarray(gguf.quants.dequantize(t.data, t.tensor_type), dtype=np.float32)
+            tensors.append((name, data))
+            w.add_tensor_info(name, data.shape, data.dtype, data.nbytes, gguf.GGMLQuantizationType.F32)
+        else:
+            tensors.append((name, t.data))
+            w.add_tensor_info(name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_ti_data_to_file()
-    for _, t in tensors:
-        w.write_tensor_data(t.data, tensor_endianess=r.endianess)
+    for _, data in tensors:
+        w.write_tensor_data(data, tensor_endianess=r.endianess)
     w.close()
-    print(f"wrote {args.output} ({sum(int(np.prod(t.data.shape)) * t.data.dtype.itemsize for _, t in tensors) / 2**20:.0f} MiB of tensors)",
+    print(f"wrote {args.output} ({sum(data.nbytes for _, data in tensors) / 2**20:.0f} MiB of tensors)",
           file=sys.stderr)
 
 
