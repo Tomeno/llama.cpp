@@ -1,8 +1,9 @@
-{#- RWKV7 G1 chat template: "System: / User: / Assistant:" turns separated by a blank line, as in the GGUF's own
-    template, but thinking is on by default ("Assistant: <think>") and enable_thinking=false gives the fake think
-    "Assistant: <think></think>" (the answer right away). Blank lines inside a message become single newlines (a blank
-    line ends a turn for RWKV). Earlier answers render without their thinking; an assistant message after the last user
-    message keeps its reasoning_content, so that llama-server can continue it. -#}
+{#- RWKV7 G1 chat template: every turn ("System: ", "User: ", "Assistant: ") ends with a blank line and the end mark ✿,
+    which is the GGUF's end-of-turn token (tokenizer.ggml.eot_token_id = 10060), so a blank line inside a message is
+    plain content. Thinking is on by default ("Assistant: <think>"); enable_thinking=false gives the fake think
+    "Assistant: <think></think>" (the answer right away). Earlier answers render without their thinking; an assistant
+    message after the last user message keeps its reasoning_content, so that llama-server can continue it. A ✿ inside a
+    message becomes ❀, so that it cannot end a turn. -#}
 {%- set ns = namespace(last_user=-1) %}
 {%- for message in messages %}
 {%- if message['role'] == 'user' %}
@@ -15,16 +16,16 @@
 {%- if message['role'] == 'assistant' and '</think>' in content %}
 {%- set content = content.split('</think>')[-1] %}
 {%- endif %}
-{%- set content = content | trim | replace('\r\n', '\n') | replace('\n\n\n\n', '\n') | replace('\n\n\n', '\n') | replace('\n\n', '\n') | replace('\n\n', '\n') %}
+{%- set content = content | replace('\r\n', '\n') | replace('✿', '❀') | trim %}
 {%- if message['role'] == 'system' %}
-{{- 'System: ' + content + '\n\n' }}
+{{- 'System: ' + content + '\n\n✿' }}
 {%- elif message['role'] == 'user' %}
-{{- 'User: ' + content + '\n\n' }}
+{{- 'User: ' + content + '\n\n✿' }}
 {%- elif message['role'] == 'assistant' %}
 {%- if loop.index0 > ns.last_user and message.reasoning_content is defined and message.reasoning_content %}
-{{- 'Assistant: <think>\n' + message.reasoning_content | trim + '\n</think>\n' + content + '\n\n' }}
+{{- 'Assistant: <think>\n' + message.reasoning_content | trim + '\n</think>\n' + content + '\n\n✿' }}
 {%- else %}
-{{- 'Assistant: ' + content + '\n\n' }}
+{{- 'Assistant: ' + content + '\n\n✿' }}
 {%- endif %}
 {%- endif %}
 {%- endfor %}
