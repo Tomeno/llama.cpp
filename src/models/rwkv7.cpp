@@ -117,6 +117,38 @@ void llama_model_rwkv7::load_arch_tensors(llama_model_loader &) {
 
 }
 
+// experiments: removes linear subspaces from what each layer writes into the residual stream (the time mix and the channel
+// mix outputs), y -> y - U U^T y, the same as orthogonalizing time_mix_output and channel_mix_value. RWKV7_ABLATE names a
+// raw f32 file [n_layer, rank, n_embd] (rank from RWKV7_ABLATE_RANK); scaled rows give partial removal, zero rows none
+static const std::vector<float> * rwkv7_ablate_basis(int64_t n_layer, int64_t rank, int64_t n_embd) {
+    static const std::vector<float> * basis = [&]() -> const std::vector<float> * {
+        const char * path = getenv("RWKV7_ABLATE");
+        if (!path) {
+            return nullptr;
+        }
+        auto * b = new std::vector<float>(n_layer*rank*n_embd);
+        FILE * f = fopen(path, "rb");
+        GGML_ASSERT(f && fread(b->data(), sizeof(float), b->size(), f) == b->size());
+        fclose(f);
+        return b;
+    }();
+    return basis;
+}
+
+class llm_graph_input_rwkv7_ablate : public llm_graph_input_i {
+public:
+    llm_graph_input_rwkv7_ablate(const float * data) : data(data) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        ggml_backend_tensor_set(u, data, 0, ggml_nbytes(u));
+    }
+
+    const float * data;
+
+    ggml_tensor * u = nullptr; // F32 [n_embd, rank]
+};
+
 std::unique_ptr<llm_graph_context> llama_model_rwkv7::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }
@@ -156,9 +188,31 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    static const int64_t ablate_rank = getenv("RWKV7_ABLATE_RANK") ? atoll(getenv("RWKV7_ABLATE_RANK")) : 1;
+    const auto * ablate = rwkv7_ablate_basis(n_layer, ablate_rank, n_embd);
+
     for (int il = il0; il < il1; ++il) {
         const llama_layer * layer = &model.layers[il];
         inpL                      = ggml_reshape_3d(ctx0, inpL, n_embd, n_seq_tokens, n_seqs);
+
+        ggml_tensor * abl_u = nullptr;
+        if (ablate) {
+            auto inp_u = std::make_unique<llm_graph_input_rwkv7_ablate>(ablate->data() + il*ablate_rank*n_embd);
+            inp_u->u = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ablate_rank);
+            ggml_set_input(inp_u->u);
+            abl_u = inp_u->u;
+            res->add_input(std::move(inp_u));
+        }
+        // [n_embd, rank] x [n_embd, n] -> coefficients [rank, n] -> [n_embd, n]
+        auto remove = [&](ggml_tensor * y) {
+            if (!abl_u) {
+                return y;
+            }
+            ggml_tensor * y2 = ggml_reshape_2d(ctx0, y, n_embd, ggml_nelements(y)/n_embd);
+            ggml_tensor * c  = ggml_mul_mat(ctx0, abl_u, y2);
+            y2 = ggml_sub(ctx0, y2, ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, abl_u)), c));
+            return ggml_reshape(ctx0, y2, y);
+        };
 
         ggml_tensor * token_shift = build_rwkv_token_shift_load(rs_inp, ubatch, il);
 
@@ -179,6 +233,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
             ggml_view_3d(ctx0, att_norm, n_embd, n_seq_tokens - 1, n_seqs, att_norm->nb[1], att_norm->nb[2], 0), 1);
 
         cur = build_rwkv7_time_mix(rs_inp, att_norm, x_prev, v_first, ubatch, il, att_shift);
+        cur = remove(cur);
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
@@ -226,7 +281,7 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
             }
             cur = build_rwkv7_channel_mix(layer, ffn_norm, x_prev, LLM_ARCH_RWKV7);
         }
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        cur = ggml_add(ctx0, remove(cur), ffn_inp);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
