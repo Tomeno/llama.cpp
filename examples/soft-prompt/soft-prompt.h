@@ -36,12 +36,16 @@ int32_t sp_score(sp_ctx * c, const float * thetas, const float * states, int32_t
 
 // gradient of sum_t w[t] * log p(resp[t]) with respect to the initial recurrent state (before the first prompt token, no
 // prefix): job j starts from states[state_idx[j]] and adds its gradient to grad[state_idx[j]] ([n_states, n_state], not
-// cleared); logp gets the log-probs (laid out as resp, w too). Every job must fit in one batch.
+// cleared); logp gets the log-probs (laid out as resp, w too). Every job must fit in one batch, unless chunked.
 // sp_state_grad with gradient checkpointing in segments of n_layers layers (0: off)
 void    sp_set_grad_ckpt(sp_ctx * c, int32_t n_layers);
 // sp_state_grad decodes up to n_seqs jobs of similar length at once (default 1), padded to the longest; all of them must fit
 // in one batch together
 void    sp_set_grad_seqs(sp_ctx * c, int32_t n_seqs);
+// sp_state_grad: jobs longer than n_tokens (0: off, the default) are backpropagated through time in chunks of n_tokens
+// tokens (RWKV7): any length with the memory of one chunk, one more forward pass. carry != 0: exact (the gradient
+// crosses the chunk boundaries); 0: truncated BPTT (every chunk from its forward state, no gradient from later chunks)
+void    sp_set_grad_chunk(sp_ctx * c, int32_t n_tokens, int32_t carry);
 
 int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_idx, int32_t n_jobs,
                       const int32_t * post, const int64_t * post_off, const int32_t * post_len,

@@ -64,6 +64,7 @@ def _load_lib(path: str) -> ctypes.CDLL:
                              _i32p, _i64p, _i32p, _i32p, _i64p, _i32p, ctypes.c_float, _f32p]
     lib.sp_set_grad_ckpt.argtypes = [ctypes.c_void_p, ctypes.c_int32]
     lib.sp_set_grad_seqs.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    lib.sp_set_grad_chunk.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
     lib.sp_state_grad.argtypes = [ctypes.c_void_p, _f32p, _i32p, ctypes.c_int32, _i32p, _i64p, _i32p, _i32p, _i64p, _i32p,
                                   _f32p, ctypes.c_float, _f32p, _f32p]
     lib.sp_capture.argtypes = [ctypes.c_void_p, ctypes.c_int32, _f32p]
@@ -227,6 +228,11 @@ class Engine:
     def set_grad_seqs(self, n_seqs: int):
         """state_grad decodes up to n_seqs jobs of similar length at once (padded to the longest; -b must hold them)"""
         self.lib.sp_set_grad_seqs(self.ctx, n_seqs)
+
+    def set_grad_chunk(self, n_tokens: int, carry: bool = True):
+        """state_grad: jobs longer than n_tokens (0: off) are backpropagated through time in chunks (RWKV7): any length
+        with the memory of one chunk; carry: exact (False: truncated BPTT)"""
+        self.lib.sp_set_grad_chunk(self.ctx, n_tokens, int(carry))
 
     def state_grad(self, states: np.ndarray, state_idx: Sequence[int], posts: Sequence[np.ndarray], resps: Sequence[np.ndarray],
                    weights: Sequence[np.ndarray], temp: float = 1.0) -> tuple[list[np.ndarray], np.ndarray]:

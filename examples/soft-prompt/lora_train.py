@@ -5,7 +5,8 @@ mode (RWKV7, EdgeRock): the base weights stay frozen as they are (e.g. Q8_0 or Q
 Start from an adapter made by lora_init.py (it records which factors are trained) or a saved one. Data: JSONL, one
 example per line, {"prompt", "response"} (only the response is trained) or {"text"} (all of it), formatted as the model
 expects. Every example is one sequence from the initial state (zero, or the frozen state of --state, e.g. a chat
-state); --max-len cuts longer ones.
+state); --max-len cuts longer ones. Long examples: --bptt-chunk N backpropagates through time in chunks of N tokens
+(exact, the memory of one chunk: --max-len is then limited by time only; --truncate: truncated BPTT instead).
 
 The loss is the mean NLL per response token of a batch (--batch-examples); AdamW with warmup and cosine decay, global
 gradient-norm clipping. One log line per step (stderr). Saves OUT (best validation loss, or the last without --val),
@@ -96,6 +97,10 @@ def main():
     ap.add_argument("--max-len", type=int, default=2048, help="tokens per example (prompt + response)")
     ap.add_argument("--grad-seqs", type=int, default=4, help="examples per decode (similar lengths, padded)")
     ap.add_argument("--ckpt", type=int, default=4, help="gradient checkpointing: layers per segment (0: off)")
+    ap.add_argument("--bptt-chunk", type=int, default=0,
+                    help="tokens per chunk of backpropagation through time (0: every example in one pass); GPU memory "
+                         "follows grad-seqs x chunk instead of grad-seqs x max-len")
+    ap.add_argument("--truncate", action="store_true", help="with --bptt-chunk: truncated BPTT (no gradient across chunks)")
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--n-val", type=int, default=0, help="validation examples used (0: all)")
     ap.add_argument("--save-every", type=int, default=0, help="also save OUT.stepN every N steps")
@@ -113,15 +118,19 @@ def main():
     if args.train_b is not None:
         meta["train_b"] = bool(args.train_b)
     g = max(1, args.grad_seqs)
-    eng = Engine(args.model, args.n_gpu_layers, g * (args.max_len + 16), args.max_len + 16, g, args.threads)
+    n_batch = g * args.bptt_chunk if args.bptt_chunk > 0 else args.max_len + 16
+    eng = Engine(args.model, args.n_gpu_layers, g * (args.max_len + 16), n_batch, g, args.threads)
     eng.lib.sp_set_grad_ckpt(eng.ctx, args.ckpt)
     eng.lib.sp_set_grad_seqs(eng.ctx, g)
+    eng.set_grad_chunk(args.bptt_chunk, not args.truncate)
     names = eng.lora_load(args.adapter, 1.0, meta["train_a"], meta["train_b"])
     trained = [i for i, n in enumerate(names) if (meta["train_a"] if n.endswith(".lora_a") else meta["train_b"])]
     n_par = sum(int(np.prod(eng.lora_shapes[i])) for i in trained)
     log(f"adapter {args.adapter}: {meta['method']}, alpha {meta['alpha']:g}, {len(names) // 2} weights, "
         f"trained {'A' if meta['train_a'] else ''}{'B' if meta['train_b'] else ''}: {n_par / 1e6:.2f} M parameters")
 
+    if args.bptt_chunk > 0:
+        log(f"BPTT in chunks of {args.bptt_chunk} tokens ({'truncated' if args.truncate else 'exact'})")
     st = load_state(args.state)
     st = np.zeros((1, eng.n_state), np.float32) if st is None else st.reshape(1, -1)
     train = load_examples(eng, args.train, args.max_len)

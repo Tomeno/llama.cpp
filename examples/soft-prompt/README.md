@@ -216,6 +216,21 @@ parameters), 120 steps of 8 chat examples (`\n\n✿` format, up to 1536 tokens, 
 replies that end with ✿: 0 -> 40 of 48 (the rest cut at 1024 tokens). The same adapter on the Q8_0 model: 0.801 -> 0.717,
 38 of 48. On the 2.9B Q8_0: ~600 tokens/s. NoRA wants a small learning rate (2e-5 to 5e-5; 2e-4 overshoots).
 
+Long examples: `--bptt-chunk N` backpropagates through time in chunks of N tokens (RWKV7). A forward pass keeps the
+state (wkv and token shift) at every chunk boundary, then the chunks are backpropagated from the last one, each from its
+boundary state, with the gradient of the next chunk's initial state injected on its final state
+(`llama_set_state_grad_end`). It is exact, not truncated: on the CPU slice the LoRA and initial-state gradients match a
+single pass to ~1e-6 relative (GPU: ~0.2%, the usual kernel noise). `--truncate` cuts the gradient at the boundaries
+(plain TBPTT, the same cost; on the check it loses 28% of the LoRA gradient). The cost is one extra forward pass; the
+GPU memory follows `--grad-seqs` x chunk instead of the example length. 7.2B Q4_K_M, NoRA r16, `--ckpt 4`, 1 sequence:
+
+| max-len | chunk | VRAM (above idle) | trained tok/s |
+| - | - | - | - |
+| 2048 | one pass | 10.9 GB | 480 |
+| 8192 | 2048 | 11.1 GB | 400 |
+| 16384 | 2048 | 11.3 GB | 380 |
+| 16384 | 1024 | 8.0 GB | 365 |
+
 Known limit: the gradient mode needs the weights on one backend (all layers offloaded, or a CPU-only build); CPU weights
 with CUDA ops crash in an in-place `acc` of the backward graph.
 
