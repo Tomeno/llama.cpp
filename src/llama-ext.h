@@ -168,6 +168,22 @@ LLAMA_API void    llama_set_state_grad_weights(struct llama_context * ctx, const
 // nullptr: query only), -1 if the last decode had no such sequence or layer
 LLAMA_API int64_t llama_get_state_grad        (struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
 
+// LoRA training. The A and B tensors of an adapter, sorted by name ("<weight>.lora_a" / ".lora_b"); get and set work on
+// F32 adapters only and return the number of floats (-1: no such tensor or not F32), shape: ne[0] ne[1] as in ggml
+LLAMA_API int32_t      llama_adapter_lora_n_tensors   (const struct llama_adapter_lora * adapter);
+LLAMA_API const char * llama_adapter_lora_tensor_name (const struct llama_adapter_lora * adapter, int32_t i);
+LLAMA_API int64_t      llama_adapter_lora_tensor_shape(const struct llama_adapter_lora * adapter, int32_t i, int64_t * ne);
+LLAMA_API int64_t      llama_adapter_lora_tensor_get  (const struct llama_adapter_lora * adapter, int32_t i, float * dst);
+LLAMA_API int64_t      llama_adapter_lora_tensor_set  (      struct llama_adapter_lora * adapter, int32_t i, const float * src);
+
+// in the state-gradient mode, the A and/or B tensors of an adapter (F32, active in the context) are parameters too: every
+// decode adds the gradient of the loss with respect to them to an accumulator (summed over the sequences of the batch).
+// adapter nullptr: off. Setting it clears the accumulator.
+LLAMA_API void    llama_set_lora_grad  (struct llama_context * ctx, struct llama_adapter_lora * adapter, bool train_a, bool train_b);
+// the accumulated gradient of tensor i of that adapter (its size in floats, 0: not trained, -1: no such tensor)
+LLAMA_API int64_t llama_get_lora_grad  (struct llama_context * ctx, int32_t i, float * dst);
+LLAMA_API void    llama_clear_lora_grad(struct llama_context * ctx);
+
 // gives seq_id its own recurrent cell now (device copy) when it shares one, e.g. right after llama_memory_seq_cp,
 // so that llama_memory_seq_state_set works before the next decode; false on error
 LLAMA_API bool llama_memory_seq_unshare(struct llama_context * ctx, llama_seq_id seq_id);

@@ -4,6 +4,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <map>
 #include <cassert>
 #include <cerrno>
@@ -421,6 +422,13 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         }
     }
 
+    for (auto & it : adapter.ab_map) {
+        adapter.tensors.push_back(it.second.a);
+        adapter.tensors.push_back(it.second.b);
+    }
+    std::sort(adapter.tensors.begin(), adapter.tensors.end(),
+            [](const ggml_tensor * x, const ggml_tensor * y) { return strcmp(x->name, y->name) < 0; });
+
     // register adapter with model
     model.loras.insert(&adapter);
 
@@ -524,4 +532,56 @@ uint64_t llama_adapter_get_alora_n_invocation_tokens(const struct llama_adapter_
 const llama_token * llama_adapter_get_alora_invocation_tokens(const llama_adapter_lora * adapter) {
     GGML_ASSERT(adapter);
     return adapter->alora_invocation_tokens.data();
+}
+
+int32_t llama_adapter_lora_n_tensors(const llama_adapter_lora * adapter) {
+    return (int32_t) adapter->tensors.size();
+}
+
+const char * llama_adapter_lora_tensor_name(const llama_adapter_lora * adapter, int32_t i) {
+    return i >= 0 && i < (int32_t) adapter->tensors.size() ? adapter->tensors[i]->name : nullptr;
+}
+
+int64_t llama_adapter_lora_tensor_shape(const llama_adapter_lora * adapter, int32_t i, int64_t * ne) {
+    if (i < 0 || i >= (int32_t) adapter->tensors.size()) {
+        return -1;
+    }
+    const ggml_tensor * t = adapter->tensors[i];
+    if (ne) {
+        ne[0] = t->ne[0];
+        ne[1] = t->ne[1];
+    }
+    return ggml_nelements(t);
+}
+
+static ggml_tensor * lora_f32_tensor(const llama_adapter_lora * adapter, int32_t i) {
+    if (i < 0 || i >= (int32_t) adapter->tensors.size()) {
+        return nullptr;
+    }
+    ggml_tensor * t = adapter->tensors[i];
+    if (t->type != GGML_TYPE_F32) {
+        LLAMA_LOG_ERROR("%s: '%s' is %s, only F32 adapters can be read or written\n", __func__, t->name, ggml_type_name(t->type));
+        return nullptr;
+    }
+    return t;
+}
+
+int64_t llama_adapter_lora_tensor_get(const llama_adapter_lora * adapter, int32_t i, float * dst) {
+    ggml_tensor * t = lora_f32_tensor(adapter, i);
+    if (!t) {
+        return -1;
+    }
+    if (dst) {
+        ggml_backend_tensor_get(t, dst, 0, ggml_nbytes(t));
+    }
+    return ggml_nelements(t);
+}
+
+int64_t llama_adapter_lora_tensor_set(llama_adapter_lora * adapter, int32_t i, const float * src) {
+    ggml_tensor * t = lora_f32_tensor(adapter, i);
+    if (!t) {
+        return -1;
+    }
+    ggml_backend_tensor_set(t, src, 0, ggml_nbytes(t));
+    return ggml_nelements(t);
 }

@@ -1116,6 +1116,42 @@ int64_t llama_context::get_state_grad(llama_seq_id seq_id, int32_t il, float * d
     return (int64_t) g.size();
 }
 
+void llama_context::set_lora_grad(llama_adapter_lora * adapter, bool train_a, bool train_b) {
+    lora_train = adapter;
+    lora_train_mask.clear();
+    lora_grads.clear();
+    if (!adapter) {
+        return;
+    }
+    for (ggml_tensor * t : adapter->tensors) {
+        const std::string name(t->name);
+        const bool is_a = name.size() > 7 && name.compare(name.size() - 7, 7, ".lora_a") == 0;
+        const bool on   = (is_a ? train_a : train_b) && t->type == GGML_TYPE_F32;
+        if ((is_a ? train_a : train_b) && t->type != GGML_TYPE_F32) {
+            LLAMA_LOG_WARN("%s: '%s' is %s, not trained (F32 only)\n", __func__, t->name, ggml_type_name(t->type));
+        }
+        lora_train_mask.push_back(on);
+        lora_grads.emplace_back(on ? ggml_nelements(t) : 0, 0.0f);
+    }
+}
+
+int64_t llama_context::get_lora_grad(int32_t i, float * dst) const {
+    if (i < 0 || i >= (int32_t) lora_grads.size()) {
+        return -1;
+    }
+    const auto & g = lora_grads[i];
+    if (dst && !g.empty()) {
+        std::copy(g.begin(), g.end(), dst);
+    }
+    return (int64_t) g.size();
+}
+
+void llama_context::clear_lora_grad() {
+    for (auto & g : lora_grads) {
+        std::fill(g.begin(), g.end(), 0.0f);
+    }
+}
+
 float llama_context::get_logprob_ith(int32_t i) {
     output_reorder();
 
@@ -1734,6 +1770,28 @@ ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type
     ggml_backend_sched_reset(sched.get());
     ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+    // the trained LoRA tensors are parameters of this pass only (a parameter is a graph node, not a leaf)
+    std::vector<ggml_tensor *> lora_params;
+    if (lora_train) {
+        for (size_t i = 0; i < lora_train_mask.size(); ++i) {
+            ggml_tensor * t = lora_train_mask[i] ? lora_train->tensors[i] : nullptr;
+            if (t) {
+                t->flags |= GGML_TENSOR_FLAG_PARAM;
+            }
+            lora_params.push_back(t);
+        }
+    }
+    struct lora_flags_reset {
+        std::vector<ggml_tensor *> & ts;
+        ~lora_flags_reset() {
+            for (ggml_tensor * t : ts) {
+                if (t) {
+                    t->flags &= ~GGML_TENSOR_FLAG_PARAM;
+                }
+            }
+        }
+    } lora_flags_reset_ { lora_params };
+
     grad_seg_cur = seg;
     ggml_cgraph * gf = model.build_graph(graph_params(res, ubatch, mctx, gtype));
     grad_seg_cur = nullptr;
@@ -1795,6 +1853,13 @@ ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type
         if (g_inp && res->t_seg_inp) {
             g_seg_inp = grad_of(res->t_seg_inp);
         }
+        // the LoRA tensors of the layers of this segment (the others are not in the graph and get no gradient)
+        lora_grad_t.assign(lora_params.size(), nullptr);
+        for (size_t i = 0; i < lora_params.size(); ++i) {
+            if (lora_params[i]) {
+                lora_grad_t[i] = grad_of(lora_params[i]);
+            }
+        }
     }
     if (res->t_logprobs) {
         ggml_set_output(res->t_logprobs);
@@ -1851,6 +1916,21 @@ ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type
     }
     if (res->t_logprobs) {
         get(res->t_logprobs, lp_grad);
+    }
+
+    if (!fwd_only) {
+        std::vector<float> tmp;
+        for (size_t i = 0; i < lora_grad_t.size(); ++i) {
+            if (lora_grad_t[i]) {
+                get(lora_grad_t[i], tmp);
+                auto & acc = lora_grads[i];
+                GGML_ASSERT(acc.size() == tmp.size());
+                for (size_t k = 0; k < tmp.size(); ++k) {
+                    acc[k] += tmp[k];
+                }
+            }
+        }
+        lora_grad_t.clear();
     }
 
     for (uint32_t s = 0; s < ubatch.n_seqs && !fwd_only; ++s) {
@@ -4735,6 +4815,18 @@ void llama_set_state_grad_weights(llama_context * ctx, const float * w, int32_t 
 
 int64_t llama_get_state_grad(llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst) {
     return ctx->get_state_grad(seq_id, il, dst);
+}
+
+void llama_set_lora_grad(llama_context * ctx, llama_adapter_lora * adapter, bool train_a, bool train_b) {
+    ctx->set_lora_grad(adapter, train_a, train_b);
+}
+
+int64_t llama_get_lora_grad(llama_context * ctx, int32_t i, float * dst) {
+    return ctx->get_lora_grad(i, dst);
+}
+
+void llama_clear_lora_grad(llama_context * ctx) {
+    ctx->clear_lora_grad();
 }
 
 float llama_get_logprob_ith(llama_context * ctx, int32_t i) {

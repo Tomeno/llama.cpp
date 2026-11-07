@@ -95,6 +95,11 @@ struct llama_context {
     void    set_state_grad_weights(const float * w, int32_t n);
     int64_t get_state_grad(llama_seq_id seq_id, int32_t il, float * dst) const;
 
+    // LoRA training, see llama_set_lora_grad
+    void    set_lora_grad(llama_adapter_lora * adapter, bool train_a, bool train_b);
+    int64_t get_lora_grad(int32_t i, float * dst) const;
+    void    clear_lora_grad();
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -461,6 +466,12 @@ private:
     size_t               sched_max_nodes_grad = 0;
     std::vector<float>   lp_grad;               // the log-probs of the last decode
     const llm_graph_grad_seg * grad_seg_cur = nullptr; // the segment of the graph being built
+
+    // LoRA training: the adapter, which of its tensors are parameters, their accumulated gradients (by tensor index)
+    llama_adapter_lora *            lora_train = nullptr;
+    std::vector<bool>               lora_train_mask;
+    std::vector<std::vector<float>> lora_grads;
+    std::vector<ggml_tensor *>      lora_grad_t; // the gradient tensors of the current pass
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
