@@ -210,6 +210,12 @@ response is trained) or `{"text"}`; one sequence per example from the initial st
 
 Gradients checked against central finite differences on an F32 4-layer slice (CPU, exact F32): directional derivatives
 agree within 0.01-0.3% for all three methods, with and without checkpointing and with the head adapter.
+QLoRA example: RWKV7 7.2B G1l in Q4_K_M (4.3 GB) on a 16 GB RTX A4000, NoRA rank 16 on the six projections (37.7 M
+parameters), 120 steps of 8 chat examples (`\n\n✿` format, up to 1536 tokens, `--grad-seqs 2 --ckpt 4`, lr 5e-5):
+~11 GB of VRAM, ~270 trained tokens/s, 30 min. Held-out NLL 0.803 -> 0.721; the end mark ✿ 4.18 -> 0.001 nats; sampled
+replies that end with ✿: 0 -> 40 of 48 (the rest cut at 1024 tokens). The same adapter on the Q8_0 model: 0.801 -> 0.717,
+38 of 48. On the 2.9B Q8_0: ~600 tokens/s. NoRA wants a small learning rate (2e-5 to 5e-5; 2e-4 overshoots).
+
 Known limit: the gradient mode needs the weights on one backend (all layers offloaded, or a CPU-only build); CPU weights
 with CUDA ops crash in an in-place `acc` of the backward graph.
 
