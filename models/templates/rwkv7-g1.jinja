@@ -2,30 +2,86 @@
     which is the GGUF's end-of-turn token (tokenizer.ggml.eot_token_id = 10060), so a blank line inside a message is
     plain content. Thinking is on by default ("Assistant: <think>"); enable_thinking=false gives the fake think
     "Assistant: <think></think>" (the answer right away). Earlier answers render without their thinking; an assistant
-    message after the last user message keeps its reasoning_content, so that llama-server can continue it. A ✿ inside a
-    message becomes ❀, so that it cannot end a turn. -#}
-{%- set ns = namespace(last_user=-1) %}
+    message after the last user message keeps its reasoning_content, so that llama-server can continue it and an agent
+    loop keeps its reasoning between tool calls. A ✿ inside a message becomes ❀, so that it cannot end a turn.
+
+    Tools (the G1 training format, see the BlinkDL/rwkv7-g1 model card): the tool list goes to the first System turn;
+    the assistant calls them with one <tool_call> block per call (a JSON {"name", "arguments"} object), and the results
+    come back in a User turn of <tool_response> blocks, one per tool message, in order:
+
+      System: ...\nTools:\n[\n{tool},\n{tool}\n]\n<instruction>\n\n✿
+      Assistant: <think>\n...\n</think>\n<tool_call>\n{"name": "f", "arguments": {...}}\n</tool_call>\n\n✿
+      User: <tool_response>\n...\n</tool_response>\n\n✿
+
+    Every tag stands on a line of its own: the RWKV tokenizer merges a tag with adjacent punctuation ("}</", ">{"). -#}
+{%- macro clean(s) -%}
+{{- (s if s is string else '') | replace('\r\n', '\n') | replace('✿', '❀') | trim -}}
+{%- endmacro -%}
+{%- macro tool_calls_block(message) -%}
+{%- for tc in message.tool_calls -%}
+{%- set f = tc.function if tc.function is defined else tc -%}
+{%- set args = f.arguments if f.arguments is defined else {} -%}
+{{- '<tool_call>\n{"name": ' + (f.name | tojson) + ', "arguments": ' + ((args if args is string else (args | tojson)) | replace('✿', '❀')) + '}\n</tool_call>' -}}
+{%- if not loop.last %}{{- '\n' }}{%- endif -%}
+{%- endfor -%}
+{%- endmacro -%}
+{%- set ns = namespace(last_user=-1, tools_done=false) %}
+{%- set has_tools = tools is defined and tools is not none and tools | length > 0 %}
 {%- for message in messages %}
 {%- if message['role'] == 'user' %}
 {%- set ns.last_user = loop.index0 %}
 {%- endif %}
 {%- endfor %}
+{%- set tools_text -%}
+{%- if has_tools -%}
+{{- 'Tools:\n[\n' -}}
+{%- for tool in tools -%}
+{{- ((tool.function if tool.function is defined else tool) | tojson) | replace('✿', '❀') -}}
+{{- ',\n' if not loop.last else '\n' -}}
+{%- endfor -%}
+{{- ']\nTo call tools, write one block per call:\n<tool_call>\n{"name": "tool_name", "arguments": {...}}\n</tool_call>\nThe results come back in <tool_response> blocks.' -}}
+{%- endif -%}
+{%- endset %}
 {{- bos_token }}
+{%- if has_tools and not (messages | length > 0 and messages[0]['role'] == 'system') %}
+{{- 'System: ' + tools_text + '\n\n✿' }}
+{%- set ns.tools_done = true %}
+{%- endif %}
 {%- for message in messages %}
 {%- set content = message['content'] if message['content'] is string else '' %}
 {%- if message['role'] == 'assistant' and '</think>' in content %}
 {%- set content = content.split('</think>')[-1] %}
 {%- endif %}
-{%- set content = content | replace('\r\n', '\n') | replace('✿', '❀') | trim %}
+{%- set content = clean(content) %}
+{%- set has_calls = message['role'] == 'assistant' and message.tool_calls is defined and message.tool_calls is not none and message.tool_calls | length > 0 %}
 {%- if message['role'] == 'system' %}
+{%- if has_tools and not ns.tools_done %}
+{{- 'System: ' + content + ('\n' if content else '') + tools_text + '\n\n✿' }}
+{%- set ns.tools_done = true %}
+{%- else %}
 {{- 'System: ' + content + '\n\n✿' }}
+{%- endif %}
 {%- elif message['role'] == 'user' %}
 {{- 'User: ' + content + '\n\n✿' }}
 {%- elif message['role'] == 'assistant' %}
+{%- set body = content %}
+{%- if has_calls %}
+{%- set body = (content + '\n' if content else '') + tool_calls_block(message) %}
+{%- endif %}
 {%- if loop.index0 > ns.last_user and message.reasoning_content is defined and message.reasoning_content %}
-{{- 'Assistant: <think>\n' + message.reasoning_content | trim + '\n</think>\n' + content + '\n\n✿' }}
+{{- 'Assistant: <think>\n' + message.reasoning_content | trim + '\n</think>\n' + body + '\n\n✿' }}
 {%- else %}
-{{- 'Assistant: ' + content + '\n\n✿' }}
+{{- 'Assistant: ' + body + '\n\n✿' }}
+{%- endif %}
+{%- elif message['role'] == 'tool' %}
+{%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' %}
+{{- 'User: ' }}
+{%- endif %}
+{{- '<tool_response>\n' + content + '\n</tool_response>' }}
+{%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' %}
+{{- '\n\n✿' }}
+{%- else %}
+{{- '\n' }}
 {%- endif %}
 {%- endif %}
 {%- endfor %}
