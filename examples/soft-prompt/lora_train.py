@@ -3,8 +3,9 @@
 mode (RWKV7, EdgeRock): the base weights stay frozen as they are (e.g. Q8_0 or Q4_K: QLoRA), the adapter is F32.
 
 Start from an adapter made by lora_init.py (it records which factors are trained) or a saved one. Data: JSONL, one
-example per line, {"prompt", "response"} (only the response is trained) or {"text"} (all of it), formatted as the model
-expects. Every example is one sequence from the initial state (zero, or the frozen state of --state, e.g. a chat
+example per line, {"prompt", "response"} (only the response is trained), {"text"} (all of it) or {"segments": [[text,
+trained], ...]} (several trained spans, e.g. the assistant turns of an agent loop; the first segment must not be trained;
+the segments are tokenized one by one, so split them where the tokenizer does not merge), formatted as the model expects. Every example is one sequence from the initial state (zero, or the frozen state of --state, e.g. a chat
 state); --max-len cuts longer ones. Long examples: --bptt-chunk N backpropagates through time in chunks of N tokens
 (exact, the memory of one chunk: --max-len is then limited by time only; --truncate: truncated BPTT instead).
 
@@ -60,20 +61,33 @@ def save_adapter(path: str, eng: Engine, meta: dict, info: dict):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
-def load_examples(eng: Engine, path: str, max_len: int) -> list[tuple[np.ndarray, np.ndarray]]:
+def load_examples(eng: Engine, path: str, max_len: int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """(prompt tokens, response tokens, response mask: 1 = trained)"""
     out, cut = [], 0
     for r in read_jsonl(path):
-        if "text" in r:
+        if "segments" in r:
+            segs = r["segments"]
+            if not segs or segs[0][1]:
+                raise ValueError(f"{path}: the first segment must not be trained")
+            post = eng.tokenize(segs[0][0])
+            parts = [(eng.tokenize(t), bool(tr)) for t, tr in segs[1:] if t]
+            resp = np.concatenate([p for p, _ in parts]) if parts else np.zeros(0, np.int32)
+            mask = np.concatenate([np.full(len(p), float(tr), np.float32) for p, tr in parts]) if parts else np.zeros(0, np.float32)
+        elif "text" in r:
             ids = eng.tokenize(r["text"])
             post, resp = ids[:1], ids[1:]
+            mask = np.ones(len(resp), np.float32)
         else:
             post, resp = eng.tokenize(r["prompt"]), eng.tokenize(r["response"])
+            mask = np.ones(len(resp), np.float32)
         if len(post) + len(resp) - 1 > max_len:
             cut += 1
-            resp = resp[:max(0, max_len + 1 - len(post))]
-        if len(post) and len(resp):
-            out.append((post, resp))
-    log(f"{path}: {len(out)} examples ({cut} cut at {max_len} tokens), {sum(len(r) for _, r in out)} trained tokens")
+            keep = max(0, max_len + 1 - len(post))
+            resp, mask = resp[:keep], mask[:keep]
+        if len(post) and len(resp) and mask.sum() > 0:
+            out.append((post, resp, mask))
+    log(f"{path}: {len(out)} examples ({cut} cut at {max_len} tokens), {int(sum(m.sum() for _, _, m in out))} trained tokens, "
+        f"{sum(len(p) + len(r) for p, r, _ in out)} in all")
     return out
 
 
@@ -152,8 +166,8 @@ def main():
     def val_loss() -> float:
         if not val:
             return float("nan")
-        lp = eng.score(th, [0] * len(val), [p for p, _ in val], [r for _, r in val], states=st)
-        return float(-sum(x.sum() for x in lp) / sum(len(x) for x in lp))
+        lp = eng.score(th, [0] * len(val), [p for p, _, _ in val], [r for _, r, _ in val], states=st)
+        return float(-sum((x * m).sum() for x, (_, _, m) in zip(lp, val)) / sum(m.sum() for _, _, m in val))
 
     params = {i: eng.lora_get(i) for i in trained}
     m = {i: np.zeros_like(p) for i, p in params.items()}
@@ -186,11 +200,12 @@ def main():
                 order, cursor = rng.permutation(len(train)), 0
             batch.append(train[order[cursor]])
             cursor += 1
-        n_tok = sum(len(r) for _, r in batch)
+        n_tok = int(sum(m.sum() for _, _, m in batch))
+        n_all = sum(len(p) + len(r) for p, r, _ in batch)
         eng.lora_grad_clear()
-        lp, _ = eng.state_grad(st, [0] * len(batch), [p for p, _ in batch], [r for _, r in batch],
-                               [np.full(len(r), 1.0 / n_tok, np.float32) for _, r in batch])
-        loss = float(-sum(x.sum() for x in lp) / n_tok)
+        lp, _ = eng.state_grad(st, [0] * len(batch), [p for p, _, _ in batch], [r for _, r, _ in batch],
+                               [m / n_tok for _, _, m in batch])
+        loss = float(-sum((x * m).sum() for x, (_, _, m) in zip(lp, batch)) / n_tok)
         # the gradient of the mean log-prob; the loss is its negative
         grads = {i: -eng.lora_grad(i) for i in trained}
         gn = math.sqrt(sum(float((x.astype(np.float64) ** 2).sum()) for x in grads.values()))
@@ -206,9 +221,10 @@ def main():
                 params[i] *= 1 - lr * args.wd
             params[i] -= lr * mh / (np.sqrt(vh) + 1e-8)
             eng.lora_set(i, params[i])
-        tok_tot += n_tok
+        tok_tot += n_all
         dt = time.time() - t0
-        log(f"step {step:5d}: train {loss:.5f}, |g| {gn:.3e}, lr {lr:.2e}, {n_tok} tokens, {dt:.1f} s ({n_tok / dt:.0f} tok/s)")
+        log(f"step {step:5d}: train {loss:.5f}, |g| {gn:.3e}, lr {lr:.2e}, {n_tok} trained of {n_all} tokens, {dt:.1f} s "
+            f"({n_all / dt:.0f} tok/s)")
         if step % args.eval_every == 0 or step == steps:
             vl = val_loss()
             improved = not val or vl < best
