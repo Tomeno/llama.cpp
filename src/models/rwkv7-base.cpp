@@ -46,6 +46,36 @@ public:
     ggml_tensor * t = nullptr;
 };
 
+// state_grad: the given gradients of the final states of the ubatch sequences on one layer (zero for the sequences
+// without one)
+class llm_graph_input_rwkv_state_end : public llm_graph_input_i {
+public:
+    llm_graph_input_rwkv_state_end(const llm_graph_state_end_grads * grads, int il, bool shift) : grads(grads), il(il), shift(shift) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const int64_t n = g->ne[0];
+        std::vector<float> buf(n);
+        for (int64_t i = 0; i < g->ne[1]; ++i) {
+            std::fill(buf.begin(), buf.end(), 0.0f);
+            const auto it = grads->find(ubatch->seq_id[i*ubatch->n_seq_tokens][0]);
+            if (it != grads->end()) {
+                const auto & per_layer = shift ? it->second.r : it->second.s;
+                if (il < (int) per_layer.size() && !per_layer[il].empty()) {
+                    GGML_ASSERT((int64_t) per_layer[il].size() == n);
+                    std::copy(per_layer[il].begin(), per_layer[il].end(), buf.begin());
+                }
+            }
+            ggml_backend_tensor_set(g, buf.data(), i*g->nb[1], n*sizeof(float));
+        }
+    }
+
+    const llm_graph_state_end_grads * grads;
+    const int  il;
+    const bool shift;
+
+    ggml_tensor * g = nullptr; // F32 [n, n_seqs]
+};
+
 llm_build_rwkv7_base::llm_build_rwkv7_base(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params),
     model(model) {}
@@ -57,6 +87,40 @@ ggml_tensor * llm_build_rwkv7_base::build_seg_host(const std::vector<float> * da
     ggml_tensor * t = inp->t;
     res->add_input(std::move(inp));
     return t;
+}
+
+ggml_tensor * llm_build_rwkv7_base::build_rwkv7_shift_param(int il) const {
+    const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
+    const int64_t n_seqs = ubatch.n_seqs;
+
+    auto inp = std::make_unique<llm_graph_input_rwkv_state_param>(mctx_cur, mctx_cur->get_r_l(il));
+    inp->param = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_r(), n_seqs);
+    ggml_set_input(inp->param);
+    ggml_set_param(inp->param);
+    ggml_format_name(inp->param, "shift_param-%d", il);
+    res->t_shift_param[il] = inp->param;
+    ggml_tensor * t = inp->param;
+    res->add_input(std::move(inp));
+
+    return ggml_reshape_3d(ctx0, t, hparams.n_embd, hparams.token_shift_count, n_seqs);
+}
+
+void llm_build_rwkv7_base::build_rwkv7_state_end_loss(ggml_tensor * end, int il, bool shift) const {
+    if (!cparams.state_grad || !state_end || state_end->empty() || (grad_seg && grad_seg->fwd_only)) {
+        return;
+    }
+    const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t n      = shift ? hparams.n_embd_r() : hparams.n_embd_s();
+    GGML_ASSERT(ggml_nelements(end) == n*n_seqs);
+
+    auto inp = std::make_unique<llm_graph_input_rwkv_state_end>(state_end, il, shift);
+    inp->g = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n, n_seqs);
+    ggml_set_input(inp->g);
+    ggml_tensor * g = inp->g;
+    res->add_input(std::move(inp));
+
+    ggml_tensor * e = ggml_is_contiguous(end) ? end : ggml_cont(ctx0, end);
+    res->t_loss_terms.push_back(ggml_sum(ctx0, ggml_mul(ctx0, ggml_reshape_2d(ctx0, e, n, n_seqs), g)));
 }
 
 ggml_tensor * llm_build_rwkv7_base::build_rwkv7_channel_mix(const llama_layer * layer,
@@ -222,6 +286,8 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_wkv(llm_graph_input_rs * inp,
     ggml_tensor * wkv_output = ggml_rwkv_wkv7(ctx0, r, w, k, v, a, b, wkv_state);
     ggml_tensor * out = ggml_view_1d(ctx0, wkv_output, n_embd * n_tokens, 0);
     wkv_state = ggml_view_1d(ctx0, wkv_output, n_embd * head_size * n_seqs, n_embd * n_tokens * sizeof(float));
+
+    build_rwkv7_state_end_loss(wkv_state, il, false);
 
     // state_grad: the cache is not written (a later pass of gradient checkpointing reads the same states)
     if (!cparams.state_grad) {

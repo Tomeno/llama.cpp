@@ -1116,6 +1116,45 @@ int64_t llama_context::get_state_grad(llama_seq_id seq_id, int32_t il, float * d
     return (int64_t) g.size();
 }
 
+int64_t llama_context::get_state_grad_shift(llama_seq_id seq_id, int32_t il, float * dst) const {
+    const auto it = shift_grads.find(seq_id);
+    if (it == shift_grads.end() || il < 0 || il >= (int32_t) it->second.size()) {
+        return -1;
+    }
+    const auto & g = it->second[il];
+    if (dst && !g.empty()) {
+        std::copy(g.begin(), g.end(), dst);
+    }
+    return (int64_t) g.size();
+}
+
+bool llama_context::set_state_grad_end(llama_seq_id seq_id, int32_t il, const float * g_s, const float * g_r) {
+    const int32_t n_layer = (int32_t) model.hparams.n_layer();
+    if (il < 0 || il >= n_layer || !model.hparams.is_recr(il)) {
+        return false;
+    }
+    auto & e = state_end_grads[seq_id];
+    e.s.resize(n_layer);
+    e.r.resize(n_layer);
+    const size_t ns = model.hparams.n_embd_s(il);
+    const size_t nr = model.hparams.n_embd_r(il);
+    if (g_s) {
+        e.s[il].assign(g_s, g_s + ns);
+    } else {
+        e.s[il].clear();
+    }
+    if (g_r) {
+        e.r[il].assign(g_r, g_r + nr);
+    } else {
+        e.r[il].clear();
+    }
+    return true;
+}
+
+void llama_context::clear_state_grad_end() {
+    state_end_grads.clear();
+}
+
 void llama_context::set_lora_grad(llama_adapter_lora * adapter, bool train_a, bool train_b) {
     lora_train = adapter;
     lora_train_mask.clear();
@@ -1735,8 +1774,10 @@ llm_graph_result * llama_context::process_ubatch_grad(const llama_ubatch & ubatc
     }
 
     state_grads.clear();
+    shift_grads.clear();
     for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
         state_grads[ubatch.seq_id[s*ubatch.n_seq_tokens][0]].resize(n_layer);
+        shift_grads[ubatch.seq_id[s*ubatch.n_seq_tokens][0]].resize(n_layer);
     }
 
     std::vector<float> g;      // gradient of the hidden state at the end of the current segment
@@ -1801,6 +1842,21 @@ ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type
         LLAMA_LOG_ERROR("%s: failed to build the graph (the model needs a state-gradient mode)\n", __func__);
         return GGML_STATUS_FAILED;
     }
+    if (!fwd_only && !state_end_grads.empty()) {
+        if (res->t_loss_terms.empty()) {
+            LLAMA_LOG_ERROR("%s: the model does not support gradients of the final states\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+        // the loss plus the dot products of the final states with their gradients
+        ggml_tensor * loss = res->t_loss;
+        loss->flags &= ~GGML_TENSOR_FLAG_LOSS;
+        for (ggml_tensor * t : res->t_loss_terms) {
+            loss = ggml_add(res->get_ctx(), loss, t);
+        }
+        ggml_set_loss(loss);
+        ggml_build_forward_expand(gf, loss);
+        res->t_loss = loss;
+    }
 
     const int n_nodes = ggml_graph_n_nodes(gf);
     {
@@ -1817,6 +1873,7 @@ ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type
     ggml_cgraph * gb   = gf;
     ggml_tensor * seed = nullptr;
     std::vector<ggml_tensor *> grads(res->t_state_param.size(), nullptr);
+    std::vector<ggml_tensor *> grads_r(res->t_shift_param.size(), nullptr);
     ggml_tensor * g_seg_inp = nullptr;
 
     auto grad_of = [&](ggml_tensor * p) {
@@ -1848,6 +1905,11 @@ ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type
         for (size_t il = 0; il < grads.size(); ++il) {
             if (res->t_state_param[il]) {
                 grads[il] = grad_of(res->t_state_param[il]);
+            }
+        }
+        for (size_t il = 0; il < grads_r.size(); ++il) {
+            if (res->t_shift_param[il]) {
+                grads_r[il] = grad_of(res->t_shift_param[il]);
             }
         }
         if (g_inp && res->t_seg_inp) {
@@ -1943,6 +2005,17 @@ ggml_status llama_context::grad_pass(const llama_ubatch & ubatch, llm_graph_type
             dst[il].assign(p->ne[0], 0.0f);
             if (grads[il]) {
                 ggml_backend_tensor_get(grads[il], dst[il].data(), s*grads[il]->nb[1], p->ne[0]*sizeof(float));
+            }
+        }
+        auto & dst_r = shift_grads[ubatch.seq_id[s*ubatch.n_seq_tokens][0]];
+        for (size_t il = 0; il < grads_r.size(); ++il) {
+            ggml_tensor * p = res->t_shift_param[il];
+            if (!p) {
+                continue;
+            }
+            dst_r[il].assign(p->ne[0], 0.0f);
+            if (grads_r[il]) {
+                ggml_backend_tensor_get(grads_r[il], dst_r[il].data(), s*grads_r[il]->nb[1], p->ne[0]*sizeof(float));
             }
         }
     }
@@ -3117,6 +3190,7 @@ llm_graph_params llama_context::graph_params(
         /*.lp_targets  =*/ &lp_targets_ub,
         /*.lp_weights  =*/ &lp_weights_ub,
         /*.grad_seg    =*/ grad_seg_cur,
+        /*.state_end   =*/ cparams.state_grad && !state_end_grads.empty() ? &state_end_grads : nullptr,
     };
 }
 
@@ -4815,6 +4889,36 @@ void llama_set_state_grad_weights(llama_context * ctx, const float * w, int32_t 
 
 int64_t llama_get_state_grad(llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst) {
     return ctx->get_state_grad(seq_id, il, dst);
+}
+
+int64_t llama_get_state_grad_shift(llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst) {
+    return ctx->get_state_grad_shift(seq_id, il, dst);
+}
+
+bool llama_set_state_grad_end(llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * g_s, const float * g_r) {
+    return ctx->set_state_grad_end(seq_id, il, g_s, g_r);
+}
+
+void llama_clear_state_grad_end(llama_context * ctx) {
+    ctx->clear_state_grad_end();
+}
+
+int64_t llama_memory_seq_shift_get(llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst) {
+    auto * mem = get_mem_recr(ctx);
+    if (!mem) {
+        return 0;
+    }
+    ctx->synchronize();
+    return mem->seq_state_r(seq_id, il, dst, nullptr);
+}
+
+int64_t llama_memory_seq_shift_set(llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * src) {
+    auto * mem = get_mem_recr(ctx);
+    if (!mem) {
+        return 0;
+    }
+    ctx->synchronize();
+    return mem->seq_state_r(seq_id, il, nullptr, src);
 }
 
 void llama_set_lora_grad(llama_context * ctx, llama_adapter_lora * adapter, bool train_a, bool train_b) {

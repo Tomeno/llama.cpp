@@ -146,6 +146,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // that layer, dst == src == nullptr: query only), -1 on error.
 LLAMA_API int64_t llama_memory_seq_state_get(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
 LLAMA_API int64_t llama_memory_seq_state_set(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * src);
+// ... the token shift row of layer il (RWKV: [n_embd_r] floats; the last normed inputs of the time mix and channel mix)
+LLAMA_API int64_t llama_memory_seq_shift_get(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
+LLAMA_API int64_t llama_memory_seq_shift_set(struct llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * src);
 
 // log-prob mode, temp > 0 (0: off, the default): every output row of a decode is the log-prob of a given target token
 // (log-softmax at temperature temp, computed on the device, clamped at about -87.3) instead of the logits, which are not
@@ -167,6 +170,14 @@ LLAMA_API void    llama_set_state_grad_weights(struct llama_context * ctx, const
 // the gradient of layer il of seq_id from the last decode; returns its size in floats (0: no state on that layer, dst ==
 // nullptr: query only), -1 if the last decode had no such sequence or layer
 LLAMA_API int64_t llama_get_state_grad        (struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
+// ... of the initial token shift (RWKV7; the rows of llama_memory_seq_shift_get)
+LLAMA_API int64_t llama_get_state_grad_shift  (struct llama_context * ctx, llama_seq_id seq_id, int32_t il, float * dst);
+// backpropagation through time over chunks (RWKV7): the gradient of the loss with respect to the final state of seq_id on
+// layer il, g_s [n_embd_s] for the wkv state and g_r [n_embd_r] for the token shift (nullptr: zero). The next decodes
+// in the state-gradient mode add sum(g_s * s_end) + sum(g_r * r_end) to their loss (also with weights all zero), so the
+// gradients of the initial state and of the LoRA tensors include what comes after the chunk; kept until cleared
+LLAMA_API bool    llama_set_state_grad_end    (struct llama_context * ctx, llama_seq_id seq_id, int32_t il, const float * g_s, const float * g_r);
+LLAMA_API void    llama_clear_state_grad_end  (struct llama_context * ctx);
 
 // LoRA training. The A and B tensors of an adapter, sorted by name ("<weight>.lora_a" / ".lora_b"); get and set work on
 // F32 adapters only and return the number of floats (-1: no such tensor or not F32), shape: ne[0] ne[1] as in ggml

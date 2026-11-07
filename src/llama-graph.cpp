@@ -1413,6 +1413,8 @@ void llm_graph_result::reset() {
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
     t_state_param.assign(LLAMA_MAX_LAYERS, nullptr);
+    t_shift_param.assign(LLAMA_MAX_LAYERS, nullptr);
+    t_loss_terms.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1590,6 +1592,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     lp_targets       (params.lp_targets),
     lp_weights       (params.lp_weights),
     grad_seg         (params.grad_seg),
+    state_end        (params.state_end),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

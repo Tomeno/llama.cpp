@@ -68,6 +68,8 @@ public:
     // reads (dst) or writes (src) the s row of layer il of the cell that holds seq_id alone, F32 only;
     // returns the row size in floats, 0 if the layer has no state, -1 on error
     int64_t seq_state_s(llama_seq_id seq_id, int32_t il, float * dst, const float * src);
+    // ... the r row (the token shift of RWKV models)
+    int64_t seq_state_r(llama_seq_id seq_id, int32_t il, float * dst, const float * src);
 
     // gives seq_id a cell of its own now (a device copy of the shared cell, e.g. after seq_cp) instead of at the
     // next ubatch, so that seq_state_s can set its state; returns false on error
@@ -129,6 +131,8 @@ public:
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
+
+    int64_t seq_state_row(ggml_tensor * s, int64_t n, llama_seq_id seq_id, float * dst, const float * src);
 
     const uint32_t n_seq_max = 1;
 

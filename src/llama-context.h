@@ -94,6 +94,9 @@ struct llama_context {
     void    set_state_grad_ckpt(int32_t n_layers);
     void    set_state_grad_weights(const float * w, int32_t n);
     int64_t get_state_grad(llama_seq_id seq_id, int32_t il, float * dst) const;
+    int64_t get_state_grad_shift(llama_seq_id seq_id, int32_t il, float * dst) const;
+    bool    set_state_grad_end(llama_seq_id seq_id, int32_t il, const float * g_s, const float * g_r);
+    void    clear_state_grad_end();
 
     // LoRA training, see llama_set_lora_grad
     void    set_lora_grad(llama_adapter_lora * adapter, bool train_a, bool train_b);
@@ -398,6 +401,8 @@ private:
 
     // state-gradient mode: gradient of the loss per sequence and layer (empty: no state on that layer)
     std::map<llama_seq_id, std::vector<std::vector<float>>> state_grads;
+    std::map<llama_seq_id, std::vector<std::vector<float>>> shift_grads; // ... of the token shift (RWKV)
+    llm_graph_state_end_grads state_end_grads; // given gradients of the final states (llama_set_state_grad_end)
     std::vector<float>       lp_out;           // ... log-prob per output row
 
     struct swap_info {

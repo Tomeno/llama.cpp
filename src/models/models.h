@@ -186,6 +186,13 @@ struct llm_build_rwkv7_base : public llm_graph_context {
 
     // state_grad with gradient checkpointing: a [n_embd, n_tokens, ne2] input tensor from host data
     ggml_tensor * build_seg_host(const std::vector<float> * data, int64_t ne2) const;
+
+    // state_grad: the initial token shift of layer il as a parameter, [n_embd, token_shift_count, n_seqs]
+    ggml_tensor * build_rwkv7_shift_param(int il) const;
+
+    // state_grad with given gradients of the final states (state_end): adds sum(end * gradient) to the loss; end: the
+    // final wkv state (shift = false) or token shift (true) of layer il, [n_embd_s or n_embd_r, n_seqs] in elements
+    void build_rwkv7_state_end_loss(ggml_tensor * end, int il, bool shift) const;
 };
 
 //

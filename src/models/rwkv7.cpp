@@ -214,7 +214,9 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
             return ggml_reshape(ctx0, y2, y);
         };
 
-        ggml_tensor * token_shift = build_rwkv_token_shift_load(rs_inp, ubatch, il);
+        // state_grad: the initial token shift is a parameter too (its gradient carries BPTT over chunks)
+        ggml_tensor * token_shift = cparams.state_grad ? build_rwkv7_shift_param(il)
+                                                       : build_rwkv_token_shift_load(rs_inp, ubatch, il);
 
         ggml_tensor * att_shift =
             ggml_view_3d(ctx0, token_shift, n_embd, 1, n_seqs, token_shift->nb[1], token_shift->nb[2], 0);
@@ -260,6 +262,8 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
                                   1);
         if (!cparams.state_grad) {
             ggml_build_forward_expand(gf, build_rwkv_token_shift_store(token_shift, ubatch, il));
+        } else {
+            build_rwkv7_state_end_loss(token_shift, il, true);
         }
 
         ffn_inp  = ggml_reshape_2d(ctx0, ffn_inp, n_embd, n_tokens);

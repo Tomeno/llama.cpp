@@ -791,6 +791,14 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// state_grad: the gradient of the loss with respect to the final recurrent state of a sequence (BPTT over chunks: the
+// gradient of the initial state of the next chunk), per layer: s (the wkv state) and r (the token shift); an empty
+// vector is zero
+struct llm_graph_state_end_grad {
+    std::vector<std::vector<float>> s, r;
+};
+using llm_graph_state_end_grads = std::map<llama_seq_id, llm_graph_state_end_grad>;
+
 // state_grad with gradient checkpointing: a graph over the layers [il0, il1) only
 struct llm_graph_grad_seg {
     int32_t il0 = 0;
@@ -849,6 +857,7 @@ struct llm_graph_params {
     const std::vector<llama_token> * lp_targets = nullptr; // target token per output row of the ubatch (logprobs_temp > 0)
     const std::vector<float>       * lp_weights = nullptr; // loss weight per output row of the ubatch (state_grad)
     const llm_graph_grad_seg       * grad_seg   = nullptr; // state_grad with gradient checkpointing: the segment
+    const llm_graph_state_end_grads * state_end = nullptr; // state_grad: gradients of the final states (nullptr: none)
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -996,6 +1005,10 @@ public:
 
     // state_grad: per layer, the initial recurrent state [n_embd_s, n_seqs] as a parameter (nullptr: no state)
     std::vector<ggml_tensor *> t_state_param;
+    // ... the initial token shift [n_embd_r, n_seqs] (RWKV)
+    std::vector<ggml_tensor *> t_shift_param;
+    // state_grad: scalar terms added to the loss (the dot products of the final states with their given gradients)
+    std::vector<ggml_tensor *> t_loss_terms;
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1102,6 +1115,7 @@ struct llm_graph_context {
     const std::vector<llama_token> * lp_targets;
     const std::vector<float>       * lp_weights;
     const llm_graph_grad_seg       * grad_seg;
+    const llm_graph_state_end_grads * state_end;
 
     const llm_graph_cb & cb_func;
 

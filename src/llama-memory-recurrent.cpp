@@ -500,8 +500,17 @@ int64_t llama_memory_recurrent::seq_state_s(llama_seq_id seq_id, int32_t il, flo
     if (il < 0 || il >= (int32_t) s_l.size() || s_l[il] == nullptr) {
         return 0;
     }
-    ggml_tensor * s = s_l[il];
-    const int64_t n = hparams.n_embd_s(il);
+    return seq_state_row(s_l[il], hparams.n_embd_s(il), seq_id, dst, src);
+}
+
+int64_t llama_memory_recurrent::seq_state_r(llama_seq_id seq_id, int32_t il, float * dst, const float * src) {
+    if (il < 0 || il >= (int32_t) r_l.size() || r_l[il] == nullptr) {
+        return 0;
+    }
+    return seq_state_row(r_l[il], hparams.n_embd_r(il), seq_id, dst, src);
+}
+
+int64_t llama_memory_recurrent::seq_state_row(ggml_tensor * s, int64_t n, llama_seq_id seq_id, float * dst, const float * src) {
     if (dst == nullptr && src == nullptr) {
         return n;
     }
