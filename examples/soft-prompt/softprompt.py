@@ -70,7 +70,17 @@ def _load_lib(path: str) -> ctypes.CDLL:
     lib.sp_generate.argtypes = [ctypes.c_void_p, _f32p, _f32p, ctypes.c_int32, ctypes.c_int32,
                                 _i32p, _i64p, _i32p, ctypes.c_int32, ctypes.c_float, ctypes.c_float, ctypes.c_int32,
                                 ctypes.c_uint64, _i32p, _i32p, _i32p]
-    for f in ("sp_score", "sp_generate", "sp_token_embeddings", "sp_get_state", "sp_state_grad", "sp_capture"):
+    lib.sp_lora_load.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_float, ctypes.c_int32, ctypes.c_int32]
+    lib.sp_lora_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    lib.sp_lora_name.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    lib.sp_lora_name.restype = ctypes.c_char_p
+    lib.sp_lora_shape.argtypes = [ctypes.c_void_p, ctypes.c_int32, _i64p]
+    for f in ("sp_lora_get", "sp_lora_set", "sp_lora_grad"):
+        getattr(lib, f).argtypes = [ctypes.c_void_p, ctypes.c_int32, _f32p]
+    for f in ("sp_lora_shape", "sp_lora_get", "sp_lora_set", "sp_lora_grad"):
+        getattr(lib, f).restype = ctypes.c_int64
+    lib.sp_lora_grad_clear.argtypes = [ctypes.c_void_p]
+    for f in ("sp_score", "sp_generate", "sp_token_embeddings", "sp_get_state", "sp_state_grad", "sp_capture", "sp_lora_load"):
         getattr(lib, f).restype = ctypes.c_int32
     return lib
 
@@ -235,6 +245,48 @@ class Engine:
                                            _ptr(rf, _i32p), _ptr(ro, _i64p), _ptr(rl, _i32p),
                                            _ptr(w, _f32p), float(temp), _ptr(lp, _f32p), _ptr(grad, _f32p)))
         return [lp[o:o + n] for o, n in zip(ro, rl)], grad
+
+    # LoRA: one F32 GGUF adapter per engine; its trained tensors get gradients from state_grad (accumulated until cleared)
+
+    def lora_load(self, path: str, scale: float = 1.0, train_a: bool = True, train_b: bool = True) -> list[str]:
+        """Loads and activates an adapter; returns the names of its tensors (the indices of lora_get/set/grad)."""
+        n = self.lib.sp_lora_load(self.ctx, path.encode(), float(scale), int(train_a), int(train_b))
+        if n < 0:
+            raise RuntimeError(self.lib.sp_last_error().decode())
+        self.lora_names = [self.lib.sp_lora_name(self.ctx, i).decode() for i in range(n)]
+        self.lora_shapes = []
+        for i in range(n):
+            ne = np.zeros(2, dtype=np.int64)
+            self.lib.sp_lora_shape(self.ctx, i, _ptr(ne, _i64p))
+            self.lora_shapes.append((int(ne[1]), int(ne[0])))  # numpy order: [ne1, ne0]
+        return self.lora_names
+
+    def lora_scale(self, scale: float):
+        self.lib.sp_lora_scale(self.ctx, float(scale))
+
+    def lora_get(self, i: int) -> np.ndarray:
+        out = np.zeros(self.lora_shapes[i], dtype=np.float32)
+        if self.lib.sp_lora_get(self.ctx, i, _ptr(out, _f32p)) != out.size:
+            raise RuntimeError(f"lora tensor {i}: not F32")
+        return out
+
+    def lora_set(self, i: int, x: np.ndarray):
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        assert x.shape == self.lora_shapes[i], (x.shape, self.lora_shapes[i])
+        if self.lib.sp_lora_set(self.ctx, i, _ptr(x, _f32p)) != x.size:
+            raise RuntimeError(f"lora tensor {i}: not F32")
+
+    def lora_grad(self, i: int) -> np.ndarray | None:
+        """The accumulated gradient of tensor i (None: not trained)."""
+        n = self.lib.sp_lora_grad(self.ctx, i, None)
+        if n <= 0:
+            return None
+        out = np.zeros(self.lora_shapes[i], dtype=np.float32)
+        self.lib.sp_lora_grad(self.ctx, i, _ptr(out, _f32p))
+        return out
+
+    def lora_grad_clear(self):
+        self.lib.sp_lora_grad_clear(self.ctx)
 
     def generate(self, theta: np.ndarray, posts: Sequence[np.ndarray], max_new: int, temp: float = 0.6, top_p: float = 0.95,
                  top_k: int = 20, seed: int = 0, state: np.ndarray | None = None) -> list[tuple[np.ndarray, bool]]:

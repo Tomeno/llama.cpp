@@ -39,6 +39,8 @@ from a saved soft prompt (it also restores the template it was trained with).
 | `generate.py` | sample one response with a soft prompt |
 | `make_data.py` | synthetic data: arithmetic continuation (`arith`), simple chat questions with answers (`simple`) |
 | `slice_model.py` | copy of a GGUF model with a subset of its blocks (fast experiments) |
+| `lora_init.py` | a new F32 GGUF LoRA adapter, initialized for LoRA, NoRA or MiSS |
+| `lora_train.py` | LoRA / NoRA / MiSS fine-tuning with exact gradients on a frozen (quantized: QLoRA) base |
 
 ## Setup
 
@@ -181,6 +183,35 @@ state with that system prompt, and requests need no system message. A persona ca
 alone: on EdgeRock the identity lives in the window KV of the prompt and in the state together (the state left by the
 persona prompt, without its KV, plays no persona; the persona prompt with the state swapped for another one plays it
 weakly).
+
+### lora_init.py, lora_train.py (LoRA, NoRA, MiSS; QLoRA)
+
+```bash
+python lora_init.py  M.gguf nora16.gguf --method nora --rank 16
+python lora_train.py -m M.gguf --adapter nora16.gguf --train train.jsonl --val val.jsonl -o out.gguf --lr 2e-5 --epochs 1
+llama-server -m M.gguf --lora out.gguf     # the result is a normal llama.cpp LoRA adapter
+```
+
+Adapter fine-tuning on the state-gradient mode (RWKV7, EdgeRock): the base weights stay as they are in the GGUF, e.g.
+Q8_0 or Q4_K (the gradient goes through the quantized matmuls, i.e. QLoRA); the adapter is F32 and its trained factors
+are parameters of the backward graph (`llama_set_lora_grad`, gradients summed over the checkpoint segments and the
+sequences of a decode). All three methods are a llama.cpp LoRA `delta W = alpha / rank * B @ A`:
+
+| method | A | B | trained |
+| - | - | - | - |
+| `lora` | Kaiming-uniform | zero | A, B |
+| `nora` (NoRA-init, as rwkv_lightning_cuda) | uniform, every column (input feature) scaled to unit norm once; alpha = rank | zero | A, B |
+| `miss` (MiSS, efficient form) | fixed 0/1: input feature k into bucket k % rank | zero (D) | B |
+
+Targets: by default the six RWKV7 projections (`time_mix_receptance/key/value/output`, `channel_mix_key/value`) of every
+layer; `--targets ...,output` adds the head, `--layers` limits the layers. Data: JSONL `{"prompt", "response"}` (the
+response is trained) or `{"text"}`; one sequence per example from the initial state (`--state`: a frozen tuned state).
+`lora_train.py` runs AdamW with warmup and cosine decay and logs one line per step.
+
+Gradients checked against central finite differences on an F32 4-layer slice (CPU, exact F32): directional derivatives
+agree within 0.01-0.3% for all three methods, with and without checkpointing and with the head adapter.
+Known limit: the gradient mode needs the weights on one backend (all layers offloaded, or a CPU-only build); CPU weights
+with CUDA ops crash in an in-place `acc` of the backward graph.
 
 ### make_data.py, slice_model.py
 

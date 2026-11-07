@@ -48,6 +48,18 @@ int32_t sp_state_grad(sp_ctx * c, const float * states, const int32_t * state_id
                       const int32_t * resp, const int64_t * resp_off, const int32_t * resp_len,
                       const float * w, float temp, float * logp, float * grad);
 
+// LoRA: loads an F32 GGUF adapter and activates it at scale; train_a / train_b: its A / B tensors are parameters of
+// sp_state_grad, which adds their gradients to an accumulator (sp_lora_grad, cleared by sp_lora_grad_clear). Returns the
+// number of tensors (A and B of every weight, sorted by name), -1 on error. One adapter per context.
+int32_t      sp_lora_load      (sp_ctx * c, const char * path, float scale, int32_t train_a, int32_t train_b);
+void         sp_lora_scale     (sp_ctx * c, float scale);
+const char * sp_lora_name      (const sp_ctx * c, int32_t i);
+int64_t      sp_lora_shape     (const sp_ctx * c, int32_t i, int64_t * ne);
+int64_t      sp_lora_get       (const sp_ctx * c, int32_t i, float * dst);
+int64_t      sp_lora_set       (sp_ctx * c, int32_t i, const float * src);
+int64_t      sp_lora_grad      (sp_ctx * c, int32_t i, float * dst);
+void         sp_lora_grad_clear(sp_ctx * c);
+
 // with SP_CAPTURE=1 in the environment: the outputs of all layers but the last for the last n_last tokens of the last
 // decode, [n_layer - 1, n_last, n_embd]; the decode must hold one sequence
 int32_t sp_capture(const sp_ctx * c, int32_t n_last, float * out);

@@ -57,6 +57,8 @@ struct sp_ctx {
 
     std::vector<std::pair<int32_t, int64_t>> state_layers; // (layer, floats) of the recurrent states
     int64_t n_state = 0;
+
+    llama_adapter_lora * lora = nullptr; // sp_lora_load
 };
 
 static std::string g_error;
@@ -447,6 +449,11 @@ SP_API sp_ctx * sp_init(const char * model_path, int32_t n_gpu_layers, int32_t n
 
 SP_API void sp_free(sp_ctx * c) {
     if (c) {
+        if (c->lora) {
+            llama_set_lora_grad(c->ctx, nullptr, false, false);
+            llama_set_adapters_lora(c->ctx, nullptr, 0, nullptr);
+            llama_adapter_lora_free(c->lora);
+        }
         llama_free(c->ctx);
         llama_model_free(c->model);
         delete c;
@@ -619,6 +626,54 @@ SP_API int32_t sp_capture(const sp_ctx * c, int32_t n_last, float * out) {
 
 SP_API void sp_set_grad_ckpt(sp_ctx * c, int32_t n_layers) {
     llama_set_state_grad_ckpt(c->ctx, n_layers);
+}
+
+SP_API int32_t sp_lora_load(sp_ctx * c, const char * path, float scale, int32_t train_a, int32_t train_b) {
+    if (c->lora) {
+        g_error = "an adapter is already loaded";
+        return -1;
+    }
+    c->lora = llama_adapter_lora_init(c->model, path);
+    if (!c->lora) {
+        g_error = std::string("failed to load the adapter ") + path;
+        return -1;
+    }
+    if (llama_set_adapters_lora(c->ctx, &c->lora, 1, &scale) != 0) {
+        g_error = "failed to set the adapter";
+        return -1;
+    }
+    llama_set_lora_grad(c->ctx, c->lora, train_a != 0, train_b != 0);
+    return llama_adapter_lora_n_tensors(c->lora);
+}
+
+SP_API void sp_lora_scale(sp_ctx * c, float scale) {
+    if (c->lora) {
+        llama_set_adapters_lora(c->ctx, &c->lora, 1, &scale);
+    }
+}
+
+SP_API const char * sp_lora_name(const sp_ctx * c, int32_t i) {
+    return c->lora ? llama_adapter_lora_tensor_name(c->lora, i) : nullptr;
+}
+
+SP_API int64_t sp_lora_shape(const sp_ctx * c, int32_t i, int64_t * ne) {
+    return c->lora ? llama_adapter_lora_tensor_shape(c->lora, i, ne) : -1;
+}
+
+SP_API int64_t sp_lora_get(const sp_ctx * c, int32_t i, float * dst) {
+    return c->lora ? llama_adapter_lora_tensor_get(c->lora, i, dst) : -1;
+}
+
+SP_API int64_t sp_lora_set(sp_ctx * c, int32_t i, const float * src) {
+    return c->lora ? llama_adapter_lora_tensor_set(c->lora, i, src) : -1;
+}
+
+SP_API int64_t sp_lora_grad(sp_ctx * c, int32_t i, float * dst) {
+    return llama_get_lora_grad(c->ctx, i, dst);
+}
+
+SP_API void sp_lora_grad_clear(sp_ctx * c) {
+    llama_clear_lora_grad(c->ctx);
 }
 
 SP_API void sp_set_grad_seqs(sp_ctx * c, int32_t n_seqs) {
