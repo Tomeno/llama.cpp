@@ -11,13 +11,15 @@ state); --max-len cuts longer ones. Long examples: --bptt-chunk N backpropagates
 
 The loss is the mean NLL per response token of a batch (--batch-examples); AdamW with warmup and cosine decay, global
 gradient-norm clipping. One log line per step (stderr). Saves OUT (best validation loss, or the last without --val),
-OUT.last and OUT.opt.npz (optimizer state, for --resume).
+OUT.last and OUT.opt.npz (optimizer state, for --resume) at every eval and every --ckpt-every steps; the files are
+replaced atomically. SIGTERM / SIGINT (systemctl stop, Ctrl-C) finish the current step, save OUT.last + OUT.opt.npz and
+exit 0: continue with --adapter OUT.last --resume (same data and options).
 
     lora_train.py -m MODEL.gguf --adapter INIT.gguf --train train.jsonl [--val val.jsonl] -o OUT.gguf --lr 1e-4 --steps 500
 """
 from __future__ import annotations
 
-import argparse, json, math, sys, time
+import argparse, json, math, os, signal, sys, time
 from pathlib import Path
 import numpy as np
 
@@ -46,7 +48,8 @@ def adapter_meta(path: str) -> dict:
 
 
 def save_adapter(path: str, eng: Engine, meta: dict, info: dict):
-    w = gguf.GGUFWriter(path, meta["arch"])
+    tmp = path + ".tmp"
+    w = gguf.GGUFWriter(tmp, meta["arch"])
     w.add_type(gguf.GGUFType.ADAPTER)
     w.add_string(gguf.Keys.Adapter.TYPE, "lora")
     w.add_float32(gguf.Keys.Adapter.LORA_ALPHA, meta["alpha"])
@@ -59,6 +62,7 @@ def save_adapter(path: str, eng: Engine, meta: dict, info: dict):
     for i, n in enumerate(eng.lora_names):
         w.add_tensor(n, eng.lora_get(i))
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    os.replace(tmp, path)
 
 
 def load_examples(eng: Engine, path: str, max_len: int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -117,6 +121,8 @@ def main():
     ap.add_argument("--truncate", action="store_true", help="with --bptt-chunk: truncated BPTT (no gradient across chunks)")
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--n-val", type=int, default=0, help="validation examples used (0: all)")
+    ap.add_argument("--ckpt-every", type=int, default=10,
+                    help="save OUT.last + OUT.opt.npz every N steps (for --resume; 0: only at evals)")
     ap.add_argument("--save-every", type=int, default=0, help="also save OUT.stepN every N steps")
     ap.add_argument("--resume", action="store_true", help="continue from OUT.opt.npz (the adapter: --adapter OUT.last)")
     ap.add_argument("--train-a", type=int, choices=[0, 1], help="override the adapter's choice")
@@ -174,11 +180,13 @@ def main():
     v = {i: np.zeros_like(p) for i, p in params.items()}
     rng = np.random.default_rng(args.seed)
     order, cursor, step0 = rng.permutation(len(train)), 0, 0
+    best_saved = None
     if args.resume:
         z = np.load(args.out + ".opt.npz")
         for i in trained:
             m[i], v[i] = z[f"m{i}"], z[f"v{i}"]
         order, cursor, step0 = z["order"], int(z["cursor"]), int(z["step"])
+        best_saved = float(z["best"]) if "best" in z else None
         rng = np.random.default_rng(args.seed + step0)
         log(f"resumed at step {step0}")
 
@@ -186,10 +194,18 @@ def main():
         save_adapter(path, eng, meta, {"step": step, "val_loss": vl, "train": args.train, "lr": args.lr, "base": args.model})
 
     def save_opt(step: int):
-        np.savez(args.out + ".opt.npz", step=step, order=order, cursor=cursor, **{f"m{i}": m[i] for i in trained},
+        tmp = args.out + ".opt.tmp.npz"
+        np.savez(tmp, step=step, order=order, cursor=cursor, best=best, **{f"m{i}": m[i] for i in trained},
                  **{f"v{i}": v[i] for i in trained})
+        os.replace(tmp, args.out + ".opt.npz")
+
+    stop = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda n, f: (stop.append(n), log(f"signal {n}: stopping after this step")))
 
     best = vl = val_loss()
+    if best_saved is not None and not math.isnan(best_saved):
+        best = min(best, best_saved)  # an OUT saved before the resume stays unless beaten
     log(f"step {step0:5d}: val {vl:.5f} (init), {steps} steps of {bs} examples, lr {args.lr:g} -> {lr_final:g}")
     tok_tot, t_start = 0, time.time()
     for step in range(step0 + 1, steps + 1):
@@ -235,8 +251,14 @@ def main():
             save_opt(step)
             log(f"step {step:5d}: val {vl:.5f} (best {best:.5f}){' saved' if improved else ''}, "
                 f"{tok_tot / (time.time() - t_start):.0f} tok/s overall")
+        elif stop or (args.ckpt_every and step % args.ckpt_every == 0):
+            save(args.out + ".last", step, vl)
+            save_opt(step)
         if args.save_every and step % args.save_every == 0:
             save(f"{args.out}.step{step}", step, vl)
+        if stop:
+            log(f"STOPPED at step {step} (saved {args.out}.last + .opt.npz; continue with --adapter {args.out}.last --resume)")
+            return
     log(f"DONE {steps} steps, best val {best:.5f}")
 
 
